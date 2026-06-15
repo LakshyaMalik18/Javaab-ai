@@ -45,6 +45,39 @@ def _singular(word: str) -> str:
     return word[:-1] if word.endswith("s") and len(word) > 3 else word
 
 
+# Business-term synonyms that may map to a single clearly-matching MONETARY measure
+# column ("revenue"/"sales" → the amount column). Deliberately NARROW: only terms
+# that denote money taken in. Derived metrics (profit, margin, …) are intentionally
+# excluded — they are not a raw column and must still fail loud.
+_MONETARY_SYNONYMS = {
+    "revenue", "revenues", "sales", "turnover", "earnings", "income",
+    "takings", "proceeds", "billings", "receipts", "grossings",
+}
+
+# Tokens that mark a numeric measure column as monetary, so a money synonym maps to
+# an amount/price column and never to a quantity/temperature measure.
+_MONETARY_HINTS = {
+    "amount", "amt", "price", "cost", "revenue", "sales", "value", "total",
+    "fee", "charge", "charges", "payment", "payments", "paid", "spend", "spent",
+    "balance", "income", "earnings", "turnover", "subtotal", "gross", "net",
+    "usd", "eur", "gbp", "dollars", "money",
+}
+
+
+def _monetary_measure_columns(contract: SchemaContract) -> list[tuple[str, str]]:
+    """Numeric measure columns that read as money (name/raw_name/meaning carries a
+    monetary hint). These are the candidates a money synonym can resolve to."""
+    out: list[tuple[str, str]] = []
+    for tc in contract.tables:
+        for cc in tc.columns:
+            if cc.role != "measure" or cc.dtype != "numeric":
+                continue
+            text = f"{cc.name} {cc.raw_name} {cc.meaning or ''}".lower()
+            if set(_TOKEN_RE.findall(text)) & _MONETARY_HINTS:
+                out.append((tc.name, cc.name))
+    return out
+
+
 @dataclass
 class Relevant:
     """The subset of the contract relevant to a question (drives lean prompt +
@@ -52,6 +85,9 @@ class Relevant:
     tables: set[str] = field(default_factory=set)
     columns: dict[str, set[str]] = field(default_factory=dict)  # table -> {cols}
     matched_anything: bool = False
+    # Set when a business synonym (e.g. "revenue") could plausibly map to two or
+    # more monetary columns — the deterministic fail-loud for genuine ambiguity.
+    clarify_question: str | None = None
 
     def provisional_hits(self, contract: SchemaContract) -> list[tuple[str, str]]:
         hits: list[tuple[str, str]] = []
@@ -87,8 +123,27 @@ def select_relevant(question: str, contract: SchemaContract) -> Relevant:
             if (name_tokens & q) or (meaning_tokens & q):
                 col_matched.setdefault(tc.name, set()).add(cc.name)
 
+    # Business-synonym mapping: a money word like "revenue"/"sales" maps to the
+    # monetary amount column even though the literal word isn't a column name.
+    # Single clear candidate → auto-map; two or more → fail loud (clarify).
+    if q & _MONETARY_SYNONYMS:
+        candidates = _monetary_measure_columns(contract)
+        # don't re-trigger on a column the question already named directly
+        already = {(t, c) for t, cs in col_matched.items() for c in cs}
+        if not already & set(candidates):  # the money concept isn't pinned yet
+            if len(candidates) == 1:
+                t, c = candidates[0]
+                col_matched.setdefault(t, set()).add(c)
+            elif len(candidates) >= 2:
+                opts = ", ".join(f"{t}.{c}" for t, c in candidates)
+                rel.clarify_question = (
+                    f"Your question could mean more than one money column ({opts}). "
+                    "Which one should I use?"
+                )
+                rel.matched_anything = True
+
     relevant_tables = table_matched | set(col_matched)
-    rel.matched_anything = bool(relevant_tables)
+    rel.matched_anything = rel.matched_anything or bool(relevant_tables)
 
     # include full column sets for matched tables (so "list customers" works),
     # but always keep id/fk columns so joins/grouping can be written.
@@ -159,6 +214,12 @@ Q: How many orders are there?
 
 Q: Total amount by customer segment
 {"sql":"SELECT c.segment, SUM(o.amount) AS total_amount FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.segment ORDER BY total_amount DESC","tables_used":["orders","customers"],"assumptions":["'total' means SUM of amount"],"needs_clarification":false,"clarifying_question":null}
+
+Q: What is the total revenue?   (schema has one money column: orders.amount)
+{"sql":"SELECT SUM(amount) AS total_revenue FROM orders","tables_used":["orders"],"assumptions":["mapped 'revenue' to the amount column"],"needs_clarification":false,"clarifying_question":null}
+
+Q: What is the total revenue?   (schema has TWO money columns: orders.amount and orders.refund_amount)
+{"sql":null,"tables_used":[],"assumptions":[],"needs_clarification":true,"clarifying_question":"Do you mean amount or refund_amount?"}
 """
 
 _SYSTEM = f"""{SYSTEM_TAG}
@@ -171,6 +232,13 @@ Hard rules:
 - ONE read-only SELECT statement. Never DELETE/UPDATE/DROP/INSERT/etc.
 - Reference only columns/tables that appear in the schema below.
 - For JOINs, use the listed relationships (FK -> PK) — do not invent keys.
+- You MAY map a common business synonym to the SINGLE clearly-matching column and
+  write the SQL: e.g. "revenue"/"sales"/"turnover"/"income" → the monetary amount
+  column. Note the mapping in `assumptions`. This is encouraged, not a guess, when
+  there is exactly one obvious match.
+- BUT if a term could plausibly mean two or more different columns (e.g. both an
+  `amount` and a `refund_amount` column, or amount in two tables), do NOT pick one:
+  set needs_clarification=true, sql=null, and ask which field.
 - If the question asks for a column/table/concept NOT in the schema, or is
   genuinely ambiguous, set needs_clarification=true, sql=null, and write a
   specific clarifying_question. Do NOT fabricate columns or guess.

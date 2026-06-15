@@ -220,6 +220,69 @@ def test_fail_loud_never_fabricates_sql_when_unsure():
         assert res.sql is None
 
 
+# ── 4b. BUSINESS-SYNONYM MAPPING (revenue → amount) ────────────────────────────
+
+def _orders_contract_and_tables(extra_money_col: bool = False):
+    """A tiny orders schema whose `amount` column sums to the ground-truth
+    $19,750.50. With extra_money_col=True a second monetary column is added so the
+    synonym 'revenue' becomes genuinely ambiguous."""
+    cols = [
+        ColumnContract(name="order_id", raw_name="order_id", dtype="numeric", role="id", is_id=True),
+        ColumnContract(name="customer_id", raw_name="customer_id", dtype="numeric", role="id", is_id=True, is_fk=True),
+        ColumnContract(name="amount", raw_name="amount", dtype="numeric", role="measure", meaning="order amount in USD"),
+    ]
+    data = {
+        "order_id": [1, 2, 3, 4],
+        "customer_id": [1, 1, 2, 3],
+        "amount": [5000.00, 7500.50, 4250.00, 3000.00],  # sum = 19750.50
+    }
+    if extra_money_col:
+        cols.append(ColumnContract(name="refund_amount", raw_name="refund_amount",
+                                   dtype="numeric", role="measure", meaning="refunded amount in USD"))
+        data["refund_amount"] = [100.0, 0.0, 50.0, 0.0]
+    contract = SchemaContract(tables=[TableContract(name="orders", row_count=4, columns=cols)])
+    return contract, {"orders": pd.DataFrame(data)}
+
+
+def test_business_synonym_revenue_maps_to_amount():
+    """'revenue' must resolve to the single monetary column (deterministically),
+    and the answer must equal the ground-truth $19,750.50."""
+    contract, tables = _orders_contract_and_tables()
+
+    # deterministic relevance: revenue → orders.amount, no ambiguity
+    rel = nl2sql_mod.select_relevant("what is the total revenue", contract)
+    assert rel.matched_anything
+    assert rel.clarify_question is None
+    assert "amount" in rel.columns.get("orders", set())
+
+    # end-to-end: model maps revenue→amount, SUMs it, ground truth comes back
+    mock = MockProvider(nl2sql=lambda q: {
+        "sql": "SELECT SUM(amount) AS total_revenue FROM orders",
+        "tables_used": ["orders"], "assumptions": ["mapped 'revenue' to the amount column"],
+        "needs_clarification": False, "clarifying_question": None})
+    res = answer("what is the total revenue", tables, contract=contract, provider=mock)
+    assert res.status == "answered"
+    assert round(res.rows[0]["total_revenue"], 2) == 19750.50
+
+
+def test_business_synonym_ambiguous_two_money_columns_clarifies():
+    """When the synonym could mean two money columns, fail loud — ask which, never
+    guess, and never even call the model."""
+    contract, tables = _orders_contract_and_tables(extra_money_col=True)
+
+    rel = nl2sql_mod.select_relevant("what is the total revenue", contract)
+    assert rel.clarify_question  # two monetary measures → ambiguous
+
+    def _boom(q):
+        raise AssertionError("nl2sql must not run for an ambiguous synonym")
+
+    res = answer("what is the total revenue", tables,
+                 contract=contract, provider=MockProvider(nl2sql=_boom))
+    assert res.status == "clarify"
+    assert res.sql is None
+    assert "amount" in res.clarifying_question and "refund_amount" in res.clarifying_question
+
+
 # ── 5. GUARDRAIL IS ALWAYS IN THE PATH ─────────────────────────────────────────
 
 def test_generated_sql_passes_through_guardrail_when_valid():

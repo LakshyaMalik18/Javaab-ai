@@ -70,7 +70,16 @@ def answer(
         # 1. what is this question about?
         relevant = nl2sql_mod.select_relevant(question, contract)
 
-        # 2. FAIL LOUD — unmapped question → refuse rather than invent SQL
+        # 2a. FAIL LOUD — a business synonym maps to two+ columns → ask which, never
+        # guess. (Deterministic: decided before the model is ever called.)
+        if relevant.clarify_question:
+            return AnswerResult(
+                status="clarify",
+                question=question,
+                clarifying_question=relevant.clarify_question,
+            )
+
+        # 2b. FAIL LOUD — unmapped question → refuse rather than invent SQL
         if not relevant.matched_anything:
             return AnswerResult(
                 status="refused",
