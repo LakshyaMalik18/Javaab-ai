@@ -1,0 +1,36 @@
+/* Javaab design tokens — editorial B&W + one accent, with depth.
+   Single source of truth for raw values; Tailwind maps the semantic names. */
+:root {
+  /* obsidian base — deepest in the wells, lifts toward surfaces */
+  --void: #060607;
+  --obsidian: #0a0a0b;
+  --obsidian-800: #0f0f11;
+  --obsidian-700: #161618;
+  --obsidian-600: #1d1d20;
+
+  /* floating surfaces — each step is a real lift off the base */
+  --surface-1: rgba(255, 255, 255, 0.025);
+  --surface-2: rgba(255, 255, 255, 0.045);
+  --surface-3: rgba(255, 255, 255, 0.07);
+
+  --ink: #f6f6f4;
+  --ink-dim: #c8c8cc;
+  --graphite: #76767f;
+  --graphite-dim: #4a4a52;
+
+  /* gold — the single accent. Restrained premium punctuation, not a wash.
+     Class names keep the `indigo`/`amber` keys; only the values are gold now. */
+  --indigo: #e8b339; /* the single accent (gold) */
+  --indigo-soft: #f0c04a;
+  --indigo-deep: #b8862a;
+  --amber: #f0c04a; /* the answer / insight — same gold warmth */
+
+  --hairline: rgba(246, 246, 244, 0.09);
+  --hairline-strong: rgba(246, 246, 244, 0.16);
+
+  --font-display: "Clash Display", "Geist", system-ui, sans-serif;
+  --font-sans: "Inter", "Geist", system-ui, sans-serif;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --maxw: 1240px;
+}

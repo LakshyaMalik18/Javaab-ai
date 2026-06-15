@@ -1,0 +1,6 @@
+company,revenue,year
+Acme Inc,1000000,2023
+"Acme, Inc.",1000000,2023
+Widget Corp,500000,2023
+Widget Corp.,500000,2023
+Globex,750000,2023

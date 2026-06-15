@@ -1,0 +1,27 @@
+[
+  {
+    "id": 1,
+    "name": "Alice",
+    "address": {
+      "city": "NYC",
+      "zip": "10001"
+    },
+    "score": 95
+  },
+  {
+    "id": 2,
+    "name": "Bob",
+    "address": {
+      "city": "LA"
+    },
+    "score": 88
+  },
+  {
+    "id": 3,
+    "name": "Carol",
+    "address": {
+      "city": "Chicago",
+      "zip": "60601"
+    }
+  }
+]

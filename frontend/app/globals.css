@@ -1,0 +1,181 @@
+/* Clash Display (display face) + Inter (body) via Fontshare/Google CSS.
+   Falls back to system fonts gracefully if offline. */
+@import url("https://api.fontshare.com/v2/css?f[]=clash-display@400,500,600,700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap");
+@import "../styles/tokens.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    /* depth, not flatness: a deep radial well over near-black, faint gold warmth */
+    background-color: var(--void);
+    background-image:
+      radial-gradient(120% 80% at 50% -10%, rgba(232, 179, 57, 0.07), transparent 55%),
+      radial-gradient(90% 60% at 85% 110%, rgba(232, 179, 57, 0.05), transparent 50%),
+      radial-gradient(100% 100% at 50% 50%, #0a0a0b 0%, #060607 100%);
+    background-attachment: fixed;
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    overflow-x: hidden;
+  }
+  ::selection {
+    background: rgba(232, 179, 57, 0.28);
+    color: var(--ink);
+  }
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+}
+
+@layer components {
+  /* ── Editorial display type — the backbone of the look ── */
+  .display {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: -0.035em;
+    line-height: 0.9;
+  }
+  .display-mega {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: -0.045em;
+    line-height: 0.82;
+  }
+  .eyebrow {
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: var(--graphite);
+  }
+
+  /* ── Floating surfaces: real lift off the base ── */
+  .card {
+    background: linear-gradient(
+      180deg,
+      var(--surface-2) 0%,
+      var(--surface-1) 100%
+    );
+    border: 1px solid var(--hairline);
+    border-radius: 20px;
+    box-shadow:
+      0 1px 0 0 rgba(255, 255, 255, 0.04) inset,
+      0 30px 60px -30px rgba(0, 0, 0, 0.8),
+      0 2px 10px -4px rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+  }
+  .card-flat {
+    background: var(--surface-1);
+    border: 1px solid var(--hairline);
+    border-radius: 16px;
+  }
+  .glass {
+    background: var(--surface-1);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--hairline);
+  }
+  .glass-strong {
+    background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--hairline);
+    box-shadow: 0 30px 60px -30px rgba(0, 0, 0, 0.8);
+  }
+  .hairline {
+    border-color: var(--hairline);
+  }
+  .accent {
+    color: var(--indigo);
+  }
+  .accent-glow {
+    color: var(--indigo);
+    text-shadow: 0 0 34px rgba(232, 179, 57, 0.45);
+  }
+  .answer {
+    color: var(--amber);
+    text-shadow: 0 0 30px rgba(240, 192, 74, 0.32);
+  }
+}
+
+/* Film grain overlay — finer + a touch stronger for texture */
+.grain::before {
+  content: "";
+  position: fixed;
+  inset: -50%;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0.045;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' /%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' /%3E%3C/svg%3E");
+  animation: grain 8s steps(4) infinite;
+}
+
+/* Vignette to deepen the edges */
+.vignette::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: radial-gradient(120% 90% at 50% 40%, transparent 55%, rgba(0, 0, 0, 0.55) 100%);
+}
+
+.aurora-blob {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(90px);
+  opacity: 0.45;
+  will-change: transform;
+}
+
+/* Caret for "typing" set-pieces */
+.caret::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  background: var(--indigo);
+  vertical-align: text-bottom;
+  animation: blink 1s steps(2) infinite;
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Lenis */
+html.lenis,
+html.lenis body { height: auto; }
+.lenis.lenis-smooth { scroll-behavior: auto !important; }
+.lenis.lenis-stopped { overflow: hidden; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .grain::before, .aurora-blob { animation: none !important; }
+}
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(246, 246, 244, 0.12);
+  border-radius: 99px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(246, 246, 244, 0.2); background-clip: padding-box; }

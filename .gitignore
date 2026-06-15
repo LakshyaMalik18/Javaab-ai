@@ -1,0 +1,33 @@
+# secrets — never commit
+.env
+*.env
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# node / frontend
+node_modules/
+.next/
+dist/
+
+# os
+.DS_Store
+CLAUDE.md
+
+# build artifacts & caches
+node_modules/
+.next/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+build/
+dist/
+.vercel/
+frontend/.env.local
+.env.local

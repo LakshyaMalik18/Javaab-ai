@@ -1,0 +1,6 @@
+product,price,discount,units_sold,revenue
+Widget A,"$1,299.99",15%,"1,500","$1,949,985.00"
+Widget B,€899,5%,"3,200","€2,876,800"
+Widget C,"₹45,000",20%,750,"₹33,750,000"
+Widget D,(£200),0%,100,"(£20,000)"
+Widget E,$2.5M,10%,50,$125k
