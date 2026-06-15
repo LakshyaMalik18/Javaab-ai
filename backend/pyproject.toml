@@ -12,7 +12,10 @@ dependencies = [
     "pydantic>=2.7.0",
     "python-multipart>=0.0.9",
     "duckdb>=0.10.3",
-    "pandas>=2.2.0",
+    # Pinned to the 2.2–2.3 family: an unbounded range let Render install a stricter
+    # pandas than local, exposing a latent str-dtype assignment bug. The <2.4 ceiling
+    # keeps local == Render and blocks the pandas 3.0 string-dtype default migration.
+    "pandas>=2.2.0,<2.4",
     "openpyxl>=3.1.2",
     "charset-normalizer>=3.3.2",
     "rapidfuzz>=3.9.0",

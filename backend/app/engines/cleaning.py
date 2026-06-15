@@ -72,10 +72,14 @@ def _coerce_numeric_column(
 ) -> pd.Series:
     before, after = [], []            # generic numeric cleanups ($, commas, (), units)
     pct_before, pct_after = [], []    # percent → fraction conversions (logged separately)
-    result = series.copy()
+    # Accumulate coerced values into a plain list (seeded from the originals), then
+    # assemble a fresh Series at the end. We deliberately do NOT mutate a copy of the
+    # source Series cell-by-cell: newer pandas forbids assigning a float into a cell
+    # of a string-dtype Series. Unparsed cells keep their original value untouched.
+    values = series.tolist()
     changed = pct_changed = 0
 
-    for i, val in series.items():
+    for pos, (_, val) in enumerate(series.items()):
         if pd.isna(val) or str(val).strip() == "":
             continue
         if isinstance(val, (int, float)):
@@ -86,14 +90,14 @@ def _coerce_numeric_column(
         # typing it is not a "change" and must NOT pollute the ledger.
         try:
             num = float(plain)
-            result.at[i] = num
+            values[pos] = num
             continue
         except ValueError:
             pass
         num = _try_numeric(plain)
         if num is None:
             continue
-        result.at[i] = num
+        values[pos] = num
         if plain.endswith("%"):
             if pct_changed < 5:
                 pct_before.append(s)
@@ -119,7 +123,7 @@ def _coerce_numeric_column(
             cells_affected=pct_changed,
             before_sample=pct_before, after_sample=pct_after,
         ))
-    return result
+    return pd.Series(values, index=series.index, name=series.name)
 
 
 # ── Date coercion ─────────────────────────────────────────────────────────────
