@@ -238,14 +238,50 @@ def ingest_csv(raw: bytes, table_name: str = "data") -> dict[str, Any]:
 
 # ── Excel ingestion ───────────────────────────────────────────────────────────
 
+def _cell_to_str(v: Any) -> str:
+    """Render an openpyxl cell value as the string the cleaning engine expects.
+    Mirrors the old pandas `dtype=str` path (integer-valued floats lose the
+    trailing `.0` so "1.0" → "1"), and treats empty cells as ""."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def ingest_excel(raw: bytes) -> dict[str, dict[str, Any]]:
-    """Return {sheet_name: {df, raw_headers, ambiguities, notes}} for each sheet."""
-    xf = pd.ExcelFile(io.BytesIO(raw), engine="openpyxl")
+    """Return {sheet_name: {df, raw_headers, ambiguities, notes, warnings}} per sheet.
+
+    Formula cells are read via `data_only=True`, so their cached computed values
+    come through as ordinary data. When a formula cell has no cached value (the
+    file was never opened/saved in a spreadsheet app), `data_only=True` yields
+    None — so rather than let the resulting empty column be silently dropped, we
+    detect those columns and surface a `warnings` entry instead of losing them.
+    """
+    from openpyxl import load_workbook
+
+    # two reads of the same bytes: values (cached results) + formulas (to tell a
+    # genuinely-empty cell apart from a formula whose result was never cached).
+    wb_values = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    wb_formulas = load_workbook(io.BytesIO(raw), data_only=False, read_only=True)
     results = {}
-    for sheet in xf.sheet_names:
-        df_raw = xf.parse(sheet, header=None, dtype=str).fillna("")
-        rows = df_raw.values.tolist()
-        rows = [[str(v) for v in r] for r in rows]
+    for sheet in wb_values.sheetnames:
+        ws_v = wb_values[sheet]
+        ws_f = wb_formulas[sheet]
+
+        rows: list[list[str]] = []
+        uncached_formula_cols: set[int] = set()  # column idx → formula w/ no cache
+        for row_v, row_f in zip(ws_v.iter_rows(), ws_f.iter_rows()):
+            cells: list[str] = []
+            for ci, (cv, cf) in enumerate(zip(row_v, row_f)):
+                fv = cf.value
+                if isinstance(fv, str) and fv.startswith("=") and cv.value is None:
+                    uncached_formula_cols.add(ci)
+                cells.append(_cell_to_str(cv.value))
+            rows.append(cells)
+
         non_empty = [r for r in rows if any(v.strip() for v in r)]
         if not non_empty:
             continue
@@ -266,11 +302,46 @@ def ingest_excel(raw: bytes) -> dict[str, dict[str, Any]]:
         footer_idxs = _detect_footer_rows(df)
         if footer_idxs:
             df = df.drop(index=footer_idxs).reset_index(drop=True)
-        results[sheet] = {"df": df, "raw_headers": raw_headers, "ambiguities": [], "notes": []}
+
+        # A formula column whose result was never cached arrives all-empty and
+        # would be silently dropped above — warn (naming the column) instead.
+        warnings: list[str] = []
+        for ci in sorted(uncached_formula_cols):
+            label = norm_headers[ci] if ci < len(norm_headers) else f"column {ci + 1}"
+            lost = label not in df.columns or df[label].replace("", pd.NA).isna().all()
+            if lost:
+                warnings.append(
+                    f"Sheet '{sheet}': column '{label}' contains formulas with no cached "
+                    f"values and couldn't be read. Open the file in Excel and re-save it "
+                    f"so the results are computed, then re-upload."
+                )
+
+        results[sheet] = {
+            "df": df, "raw_headers": raw_headers,
+            "ambiguities": [], "notes": [], "warnings": warnings,
+        }
     return results
 
 
 # ── JSON ingestion ────────────────────────────────────────────────────────────
+
+def _stringify_list(v: list) -> str:
+    """Flatten a JSON array into a single text value, one cell per record.
+
+    Scalars are comma-joined (["urgent","vip"] → "urgent, vip"); object/array
+    elements are JSON-serialized so structure is preserved rather than lost or
+    rendered as Python reprs. This keeps the value as plain text the cleaning
+    engine can handle, and never explodes a record into multiple rows."""
+    parts = []
+    for item in v:
+        if isinstance(item, (dict, list)):
+            parts.append(json.dumps(item, ensure_ascii=False))
+        elif item is None:
+            parts.append("")
+        else:
+            parts.append(str(item))
+    return ", ".join(parts)
+
 
 def _flatten_obj(obj: dict, prefix: str = "") -> dict:
     out = {}
@@ -278,6 +349,9 @@ def _flatten_obj(obj: dict, prefix: str = "") -> dict:
         key = f"{prefix}.{k}" if prefix else k
         if isinstance(v, dict):
             out.update(_flatten_obj(v, key))
+        elif isinstance(v, list):
+            # arrays → comma-joined text in one cell (no row explosion, no drop)
+            out[key] = _stringify_list(v)
         else:
             out[key] = v
     return out
@@ -287,7 +361,12 @@ def ingest_json(raw: bytes, table_name: str = "data") -> dict[str, Any]:
     text = detect_and_decode(raw)
     data = json.loads(text)
     if isinstance(data, list):
-        records = [_flatten_obj(r) if isinstance(r, dict) else {"value": r} for r in data]
+        records = [
+            _flatten_obj(r)
+            if isinstance(r, dict)
+            else {"value": _stringify_list(r) if isinstance(r, list) else r}
+            for r in data
+        ]
     elif isinstance(data, dict):
         records = [_flatten_obj(data)]
     else:

@@ -1,6 +1,6 @@
 # Javaab — the analyst in your pocket
 
-Privacy-first, executive-grade natural-language analytics.
+Executive-grade natural-language analytics, with Privacy Mode built in.
 
 ## License
 

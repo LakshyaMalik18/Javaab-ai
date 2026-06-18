@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import (
+    cleaning_routes,
     metrics_routes,
     query_routes,
     schema_routes,
@@ -84,6 +85,7 @@ def create_app() -> FastAPI:
 
     app.include_router(session_routes.router)
     app.include_router(upload_routes.router)
+    app.include_router(cleaning_routes.router)
     app.include_router(schema_routes.router)
     app.include_router(query_routes.router)
     app.include_router(metrics_routes.router)

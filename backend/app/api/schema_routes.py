@@ -92,6 +92,25 @@ def confirm_schema(body: ConfirmSchemaRequest, session: Session = Depends(get_se
             )
         applied.append(f"join:{choice.from_table}~{choice.to_table}")
 
+    # 4. user-defined manual joins — validated against the real schema, then added as
+    # the active link for their pair so they flow into the SAME machinery as
+    # discovered joins (nl2sql prompt + join-path traversal + guardrail whitelist).
+    # An invalid join (missing table/column, or self-join) is rejected, not stored.
+    for mr in body.manual_relationships:
+        ok = contract.add_manual_relationship(
+            mr.from_table, mr.from_col, mr.to_table, mr.to_col
+        )
+        if not ok:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"invalid manual join {mr.from_table}.{mr.from_col} -> "
+                    f"{mr.to_table}.{mr.to_col}: both tables and columns must exist "
+                    "and the tables must differ"
+                ),
+            )
+        applied.append(f"manual-join:{mr.from_table}~{mr.to_table}")
+
     payload = _contract_payload(session)
     payload["applied"] = applied
     return payload

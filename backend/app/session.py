@@ -27,7 +27,7 @@ from app.engines import schema_contract as contract_mod
 from app.llm import FallbackProvider, GeminiProvider, GroqProvider, get_provider
 from app.llm.base import LLMConfigError, LLMProvider
 from app.models import AnswerResult, SchemaContract
-from app.upload_pipeline import UploadResult
+from app.upload_pipeline import UploadResult, rebuild_from_raw, validate_rules
 
 #: in-memory marker — sessions NEVER touch a disk file.
 IN_MEMORY = ":memory:"
@@ -66,6 +66,20 @@ def _default_provider_factory(*, privacy_mode: bool = False, user_key: str | Non
     )
 
 
+def manual_join_reset_warning(labels: list[str], action: str) -> list[str]:
+    """Build the user-facing warning that a rebuild discarded manual joins. Empty list
+    when there were none to lose (so no warning is shown). `action` is the trigger,
+    e.g. 'Re-uploading' / 'Applying a cleaning rule'."""
+    if not labels:
+        return []
+    n = len(labels)
+    plural = "s" if n > 1 else ""
+    return [
+        f"{action} reset {n} manually-defined join{plural} ({'; '.join(labels)}). "
+        "Redefine them on the Relationships step."
+    ]
+
+
 class Session:
     """One user session. Owns its data and its in-memory DuckDB connection."""
 
@@ -93,6 +107,11 @@ class Session:
 
         # user-derived state (all wiped on close)
         self.tables: dict[str, pd.DataFrame] = {}
+        # the RAW, pre-clean frames — retained IN MEMORY ONLY so custom cleaning rules
+        # can re-run the engine without a re-upload. Wiped on close like everything else.
+        self.raw_tables: dict[str, pd.DataFrame] = {}
+        # custom cleaning rules added this session (persist + re-apply on each re-run)
+        self.cleaning_rules: list[dict] = []
         self.profiles: dict[str, dict] = {}
         self.relationships: list[dict] = []
         self.ledger: list[dict] = []
@@ -139,6 +158,8 @@ class Session:
             self._con.close()
         finally:
             self.tables.clear()
+            self.raw_tables.clear()       # the retained raw frames die with the session
+            self.cleaning_rules.clear()
             self.profiles.clear()
             self.relationships.clear()
             self.ledger.clear()
@@ -148,6 +169,34 @@ class Session:
             self.contract = None
             self._user_key = None
 
+    # ── manual-join loss detection (notification only) ───────────────────────────
+
+    def manual_join_labels(self) -> list[str]:
+        """User-defined joins that exist ONLY in the cached contract — i.e. edges not
+        among the discovered relationships. These are silently lost on any contract
+        rebuild (re-upload / apply-rules), so callers surface a warning before rebuild.
+        Returns [] when there's no contract or no manual joins (nothing to warn about).
+
+        v1 does NOT preserve these across a rebuild (that's a v1.1 item) — this only
+        makes the loss non-silent. Comparison is undirected so a discovered edge whose
+        orientation differs is never mistaken for a manual one (avoids false warnings)."""
+        if self.contract is None:
+            return []
+        discovered: set[frozenset] = set()
+        for e in self.relationships:
+            if isinstance(e, dict):
+                ft, fc, tt, tc = e["from_table"], e["from_col"], e["to_table"], e["to_col"]
+            else:
+                ft, fc, tt, tc = e.from_table, e.from_col, e.to_table, e.to_col
+            discovered.add(frozenset({(ft, fc), (tt, tc)}))
+
+        manual: list[str] = []
+        for e in self.contract.relationships:
+            pair = frozenset({(e.from_table, e.from_col), (e.to_table, e.to_col)})
+            if pair not in discovered:
+                manual.append(f"{e.from_table}.{e.from_col} → {e.to_table}.{e.to_col}")
+        return manual
+
     # ── data loading ─────────────────────────────────────────────────────────────
 
     def load_upload(self, up: UploadResult) -> None:
@@ -155,6 +204,7 @@ class Session:
         register the cleaned tables into this session's DuckDB."""
         self._ensure_open()
         self.tables.update(up.tables)
+        self.raw_tables.update(up.raw_tables)
         self.profiles.update(up.profiles)
         self.relationships = up.relationships
         self.ledger.extend(up.ledger)
@@ -165,6 +215,129 @@ class Session:
         self.contract = None
         for name, df in up.tables.items():
             self._con.register(name, df)
+
+    # ── duplicate resolution (explicit, user-driven — never auto-removes) ─────────
+
+    def remove_duplicate_rows(self, decisions: list[dict]) -> dict:
+        """Drop the duplicate rows the user explicitly chose to remove and re-point
+        this session's DuckDB at the trimmed frames, so every later query sees the
+        removal. SAFE BY DESIGN: only a decision with action=='remove' drops rows;
+        for each such group the first reported index is KEPT (the representative) and
+        the rest are dropped. 'keep' decisions and unmentioned groups change nothing —
+        nothing is ever auto-removed.
+
+        `row_indices` are treated as positional offsets into the table (matching how
+        the upload flags report exact groups and near pairs). Returns
+        {removed_rows, tables: <updated table_meta>}."""
+        self._ensure_open()
+
+        # collect the positional rows to drop, per table (keep each group's first)
+        drop_by_table: dict[str, set[int]] = {}
+        for d in decisions:
+            if d.get("action") != "remove":
+                continue
+            table = d.get("table")
+            idxs = [int(i) for i in (d.get("row_indices") or [])]
+            if table not in self.tables or len(idxs) < 2:
+                continue
+            drop_by_table.setdefault(table, set()).update(idxs[1:])
+
+        removed_total = 0
+        for table, positions in drop_by_table.items():
+            df = self.tables[table]
+            n = len(df)
+            valid = sorted(p for p in positions if 0 <= p < n)
+            if not valid:
+                continue
+            trimmed = df.drop(df.index[valid]).reset_index(drop=True)
+            removed_total += n - len(trimmed)
+            self.tables[table] = trimmed
+            # re-point DuckDB at the trimmed frame so queries reflect the removal
+            try:
+                self._con.unregister(table)
+            except Exception:
+                pass
+            self._con.register(table, trimmed)
+            for meta in self.table_meta:
+                if meta.get("name") == table:
+                    meta["row_count"] = int(len(trimmed))
+
+        # the resolved duplicate flags no longer describe the data — drop them for any
+        # table we modified so the report can't keep offering already-removed rows.
+        # (Column meanings/types/joins are unchanged by dropping rows, so the cached
+        # contract stays valid and we avoid a needless re-label LLM call.)
+        if drop_by_table:
+            self.flags = [
+                f for f in self.flags
+                if not (
+                    f.get("kind") in ("exact_duplicate", "near_duplicate")
+                    and f.get("table") in drop_by_table
+                )
+            ]
+
+        return {"removed_rows": removed_total, "tables": self.table_meta}
+
+    # ── custom cleaning rules (re-run cleaning from the retained raw frames) ──────
+
+    def apply_cleaning_rules(self, new_rules: list[dict]) -> dict:
+        """Validate and apply custom cleaning rules, re-running the cleaning engine
+        over the RETAINED RAW frames (never a re-upload) and re-pointing DuckDB at the
+        freshly-cleaned tables. Rules accumulate per session and the FULL set is
+        re-applied each call, so the result is deterministic regardless of call order.
+
+        NOTE — interaction with remove_duplicate_rows(): re-cleaning rebuilds each
+        table from raw, so any rows previously dropped via Remove-dupe REAPPEAR and the
+        duplicates are re-detected (re-flagged) for the user to act on again. Rule
+        application is a from-raw rebuild; row-level dedup is a separate edit on the
+        cleaned set and is intentionally not replayed here.
+
+        Raises SessionError (→ 400) on an invalid rule; nothing is applied in that case."""
+        self._ensure_open()
+        if not self.raw_tables:
+            raise SessionError("no data uploaded yet")
+        try:
+            validated = validate_rules(new_rules, self.raw_tables)
+        except ValueError as e:
+            raise SessionError(str(e))
+
+        # accumulate, then re-apply the FULL rule set from raw
+        # a re-clean rebuilds the contract → any manual joins on it are lost; capture
+        # them now (before the rebuild) so we can warn rather than drop them silently.
+        lost_manual = manual_join_reset_warning(
+            self.manual_join_labels(), "Applying a cleaning rule"
+        )
+
+        self.cleaning_rules = self.cleaning_rules + validated
+        rebuilt = rebuild_from_raw(self.raw_tables, self.cleaning_rules)
+
+        # swap the cleaned state in wholesale (raw_tables holds the complete set)
+        for name in list(self.tables):
+            try:
+                self._con.unregister(name)
+            except Exception:
+                pass
+        self.tables = dict(rebuilt.tables)
+        self.profiles = dict(rebuilt.profiles)
+        self.relationships = list(rebuilt.relationships)
+        self.ledger = list(rebuilt.ledger)
+        self.flags = list(rebuilt.flags)
+        self.table_meta = list(rebuilt.table_meta)
+        # data changed → the cached contract (and any manual joins on it) is rebuilt
+        self.contract = None
+        for name, df in self.tables.items():
+            self._con.register(name, df)
+
+        return {
+            "tables": self.table_meta,
+            "ledger": {
+                "total_cells_affected": sum(r["cells_affected"] for r in self.ledger),
+                "records": self.ledger,
+            },
+            "flags": self.flags,
+            "errors": rebuilt.errors,
+            "warnings": lost_manual,
+            "rules_applied": len(self.cleaning_rules),
+        }
 
     # ── schema contract (built once, cached) ─────────────────────────────────────
 

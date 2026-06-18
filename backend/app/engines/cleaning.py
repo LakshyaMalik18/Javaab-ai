@@ -442,6 +442,10 @@ def clean(
     # 3.5 Finalise dtypes: adopt a numeric dtype only when every non-null value
     # parses cleanly (leaves ISO-date and text columns as object).
     for col in df.columns:
+        # respect an explicit non-numeric force_type: a user who forced a numeric-
+        # looking column to text/date/boolean must not have it silently re-numified.
+        if force_types.get(col) in ("text", "date", "boolean"):
+            continue
         orig_notna = df[col].notna()
         if not orig_notna.any():
             continue

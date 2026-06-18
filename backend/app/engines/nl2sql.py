@@ -331,14 +331,21 @@ Q: how many bond1 sold   (schema: trades(bond_id [values: BOND1, BOND2], buy_sel
 {"sql":"SELECT SUM(quantity) AS total_sold FROM trades WHERE bond_id = 'BOND1' AND buy_sell = 'SELL'","tables_used":["trades"],"assumptions":["mapped 'bond1' to bond_id = 'BOND1'","mapped 'sold' to buy_sell = 'SELL'","'how many' = SUM(quantity)"],"needs_clarification":false,"clarifying_question":null}
 
 Q: what's the total profit   (schema has revenue but NO cost/profit column anywhere)
-{"sql":null,"tables_used":[],"assumptions":[],"needs_clarification":true,"clarifying_question":"I can see revenue but there's no cost column, so I can't compute profit. Want total revenue instead?"}
+{"sql":null,"tables_used":[],"assumptions":[],"needs_clarification":true,"clarifying_question":"I can see revenue but there's no cost column, so I can't compute profit. Want total revenue instead?","proposed_action":"what is the total revenue"}
+
+Q: drop buy records   (schema: trades(bond_id, buy_sell [values: BUY, SELL], quantity))
+{"sql":null,"tables_used":[],"assumptions":[],"needs_clarification":true,"clarifying_question":"I can't drop or modify records — Javaab is read-only. Want me to show the buy records instead?","proposed_action":"show the records where buy_sell is BUY"}
+
+Q: Total amount   (schema has TWO money columns: orders.amount and orders.refund_amount)
+{"sql":null,"tables_used":[],"assumptions":[],"needs_clarification":true,"clarifying_question":"Do you mean amount or refund_amount?","proposed_action":null}
 """
 
 _SYSTEM = f"""{SYSTEM_TAG}
 You write DuckDB SQL from a natural-language question. Use ONLY the tables and
 columns in the provided schema. Return STRICT JSON only, shape:
 {{"sql": "<single SELECT or null>", "tables_used": [..], "assumptions": [..],
-  "needs_clarification": <bool>, "clarifying_question": "<question or null>"}}
+  "needs_clarification": <bool>, "clarifying_question": "<question or null>",
+  "proposed_action": "<concrete runnable restatement, or null>"}}
 
 Hard rules:
 - ONE read-only SELECT statement. Never DELETE/UPDATE/DROP/INSERT/etc.
@@ -365,6 +372,14 @@ Hard rules:
 - If the question asks for a column/table/concept NOT in the schema, or is
   genuinely ambiguous, set needs_clarification=true, sql=null, and write a
   specific clarifying_question. Do NOT fabricate columns or guess.
+- AFFIRMATIVE SHORTCUT: when you decline (needs_clarification=true) BUT a single
+  concrete, runnable SELECT alternative exists — e.g. the user asked to drop/delete
+  records (you're read-only, so offer to SHOW them) or asked for an unavailable
+  metric you can substitute — ALSO set `proposed_action` to that alternative phrased
+  as a plain question against real columns/values (e.g. "show the records where
+  buy_sell is BUY"). It must be runnable as-is. Set proposed_action=null when the
+  clarify has no single sensible action — e.g. you're asking the user to pick
+  between two columns, or the concept truly isn't in the data. Never invent one.
 - State any interpretation (e.g. "last month") in `assumptions`.
 
 {_FEWSHOT}"""
@@ -405,4 +420,5 @@ def generate_sql(
         assumptions=list(raw.get("assumptions") or []),
         needs_clarification=bool(raw.get("needs_clarification", False)),
         clarifying_question=raw.get("clarifying_question"),
+        proposed_action=(str(raw["proposed_action"]) if raw.get("proposed_action") else None),
     )

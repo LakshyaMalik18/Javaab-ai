@@ -332,6 +332,317 @@ def test_idle_timeout_wipes_session():
     assert sid not in app.state.store._sessions
 
 
+# ── 6b. RESOLVE DUPLICATES — removal actually reaches query results ──────────────
+
+_COUNT_SQL = {
+    "sql": "SELECT COUNT(*) AS n FROM sales",
+    "tables_used": ["sales"],
+    "assumptions": [],
+    "needs_clarification": False,
+    "clarifying_question": None,
+}
+
+_DUPE_CSV = (
+    b"name,amount\n"
+    b"Acme,100\n"
+    b"Beta,200\n"
+    b"Acme,100\n"
+    b"Gamma,300\n"
+    b"Acme,100\n"
+)
+
+
+def test_resolve_duplicates_removes_rows_from_query_results():
+    """End-to-end: a 'remove' decision drops the chosen duplicate rows from the
+    session's real data, so a later COUNT reflects the removal — proving it's wired
+    through DuckDB, not just local UI state. 'keep' removes nothing."""
+    app, client = _client(nl2sql=lambda q: _COUNT_SQL)
+    sid = _new_session(client)
+    h = {"X-Session-Id": sid}
+
+    up = client.post("/upload", files=[("files", ("sales.csv", _DUPE_CSV, "text/csv"))], headers=h)
+    assert up.status_code == 200, up.text
+    exact = next(f for f in up.json()["flags"] if f["kind"] == "exact_duplicate")
+    group = exact["groups"][0]                 # [0, 2, 4] — three identical Acme rows
+    assert len(group) == 3
+
+    # baseline: all five rows are present
+    a0 = client.post("/ask", json={"question": "how many rows in sales"}, headers=h).json()
+    assert a0["status"] == "answered"
+    assert a0["rows"][0]["n"] == 5
+
+    # remove the duplicates: keep the first Acme (index 0), drop the other two
+    rd = client.post(
+        "/resolve-duplicates",
+        json={"decisions": [{"table": "sales", "row_indices": group, "action": "remove"}]},
+        headers=h,
+    )
+    assert rd.status_code == 200, rd.text
+    assert rd.json()["removed_rows"] == 2
+    assert next(t["row_count"] for t in rd.json()["tables"] if t["name"] == "sales") == 3
+
+    # a LATER query now reflects the removal — the duplicate rows are genuinely gone
+    a1 = client.post("/ask", json={"question": "how many rows in sales now"}, headers=h).json()
+    assert a1["status"] == "answered"
+    assert a1["rows"][0]["n"] == 3
+
+    # a 'keep' decision (and the default) never removes anything
+    rd2 = client.post(
+        "/resolve-duplicates",
+        json={"decisions": [{"table": "sales", "row_indices": [0, 1], "action": "keep"}]},
+        headers=h,
+    )
+    assert rd2.status_code == 200, rd2.text
+    assert rd2.json()["removed_rows"] == 0
+    a2 = client.post("/ask", json={"question": "still how many in sales"}, headers=h).json()
+    assert a2["rows"][0]["n"] == 3
+
+
+# ── 6c. MANUAL JOIN — persists, becomes active, and answers a query ──────────────
+
+_MANUAL_JOIN_SQL = {
+    "sql": "SELECT d.budget, s.name FROM staff s JOIN depts d ON s.team = d.k",
+    "tables_used": ["staff", "depts"],
+    "assumptions": [],
+    "needs_clarification": False,
+    "clarifying_question": None,
+}
+
+# Dissimilar column names ('k' vs 'team') → value-based discovery deliberately
+# misses this join, so it's the perfect case for a user-defined manual join.
+_DEPTS_CSV = b"k,budget\nENG,100\nSALES,200\nOPS,300\n"
+_STAFF_CSV = b"name,team\nAlice,ENG\nBob,SALES\nCarol,ENG\nDan,OPS\n"
+
+
+def test_manual_join_persists_becomes_active_and_is_used_in_query():
+    """A user-defined join the auto-discovery missed: before defining it, a question
+    needing the join fails loud (the join key isn't a known relationship, so the
+    guardrail rejects it); after defining it, the SAME question answers — proving the
+    manual edge flows into active_relationships() and the live query path."""
+    app, client = _client(nl2sql=lambda q: _MANUAL_JOIN_SQL)
+    sid = _new_session(client)
+    h = {"X-Session-Id": sid}
+
+    up = client.post(
+        "/upload",
+        files=[
+            ("files", ("depts.csv", _DEPTS_CSV, "text/csv")),
+            ("files", ("staff.csv", _STAFF_CSV, "text/csv")),
+        ],
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+
+    # auto-discovery missed the join (dissimilar names) → contract has no relationship
+    sc = client.get("/schema", headers=h).json()
+    assert sc["relationships"] == []
+
+    q = {"question": "show budget by team for staff and depts"}
+
+    # BEFORE: the join key isn't a discovered relationship → guardrail fails it loud
+    before = client.post("/ask", json=q, headers=h).json()
+    assert before["status"] == "refused"
+    assert not before["rows"]
+
+    # define the manual join — it must validate, persist, and become the active link
+    cs = client.post(
+        "/confirm-schema",
+        json={
+            "manual_relationships": [
+                {"from_table": "staff", "from_col": "team", "to_table": "depts", "to_col": "k"}
+            ]
+        },
+        headers=h,
+    )
+    assert cs.status_code == 200, cs.text
+    active = [r for r in cs.json()["relationships"] if r["active"]]
+    assert len(active) == 1  # exactly one active link for the pair
+    a = active[0]
+    assert (a["from_table"], a["from_col"], a["to_table"], a["to_col"]) == (
+        "staff", "team", "depts", "k",
+    )
+
+    # AFTER: the identical question now ANSWERS, using the manual join
+    after = client.post("/ask", json=q, headers=h).json()
+    assert after["status"] == "answered", after
+    assert after["rows"]
+    assert "budget" in after["columns"]
+
+    # an INVALID manual join (column doesn't exist) is rejected — nothing persisted
+    bad = client.post(
+        "/confirm-schema",
+        json={
+            "manual_relationships": [
+                {"from_table": "staff", "from_col": "nope", "to_table": "depts", "to_col": "k"}
+            ]
+        },
+        headers=h,
+    )
+    assert bad.status_code == 400, bad.text
+
+
+# ── 6d. CUSTOM CLEANING RULES — each type changes the cleaned output ─────────────
+
+# "feline" won't fuzzy-merge with "cat" automatically, and 9999 is a real number —
+# so each effect below is attributable to the user's rule, not the auto engine.
+_ZOO_CSV = b"animal,score\ncat,10\nfeline,9999\ncat,30\n"
+
+
+def test_apply_rule_null_token_reduces_nonnull_count():
+    count_sql = {
+        "sql": "SELECT COUNT(score) AS n FROM zoo", "tables_used": ["zoo"],
+        "assumptions": [], "needs_clarification": False, "clarifying_question": None,
+    }
+    app, client = _client(nl2sql=lambda q: count_sql)
+    sid = _new_session(client)
+    h = {"X-Session-Id": sid}
+    client.post("/upload", files=[("files", ("zoo.csv", _ZOO_CSV, "text/csv"))], headers=h)
+
+    a0 = client.post("/ask", json={"question": "count score in zoo"}, headers=h).json()
+    assert a0["status"] == "answered" and a0["rows"][0]["n"] == 3
+
+    rr = client.post(
+        "/apply-rules",
+        json={"rules": [{"type": "null_token", "column": "score", "params": {"value": "9999"}}]},
+        headers=h,
+    )
+    assert rr.status_code == 200, rr.text
+
+    a1 = client.post("/ask", json={"question": "count score in zoo"}, headers=h).json()
+    assert a1["rows"][0]["n"] == 2  # the 9999 row is now NULL → not counted
+
+
+def test_apply_rule_force_type_changes_dtype():
+    app, client = _client()
+    sid = _new_session(client)
+    h = {"X-Session-Id": sid}
+    client.post("/upload", files=[("files", ("zoo.csv", _ZOO_CSV, "text/csv"))], headers=h)
+
+    def _score_dtype():
+        sc = client.get("/schema", headers=h).json()
+        zoo = next(t for t in sc["tables"] if t["name"] == "zoo")
+        return next(c for c in zoo["columns"] if c["name"] == "score")["dtype"]
+
+    assert _score_dtype() == "numeric"  # inferred
+    rr = client.post(
+        "/apply-rules",
+        json={"rules": [{"type": "force_type", "column": "score", "params": {"dtype": "text"}}]},
+        headers=h,
+    )
+    assert rr.status_code == 200, rr.text
+    assert _score_dtype() == "text"  # forced, and NOT re-numified by the finalise pass
+
+
+def test_apply_rule_merge_values_collapses_groups():
+    distinct_sql = {
+        "sql": "SELECT COUNT(DISTINCT animal) AS n FROM zoo", "tables_used": ["zoo"],
+        "assumptions": [], "needs_clarification": False, "clarifying_question": None,
+    }
+    app, client = _client(nl2sql=lambda q: distinct_sql)
+    sid = _new_session(client)
+    h = {"X-Session-Id": sid}
+    client.post("/upload", files=[("files", ("zoo.csv", _ZOO_CSV, "text/csv"))], headers=h)
+
+    a0 = client.post("/ask", json={"question": "distinct animal in zoo"}, headers=h).json()
+    assert a0["rows"][0]["n"] == 2  # cat, feline
+
+    rr = client.post(
+        "/apply-rules",
+        json={"rules": [{"type": "merge_values", "column": "animal",
+                         "params": {"from": ["feline"], "to": "cat"}}]},
+        headers=h,
+    )
+    assert rr.status_code == 200, rr.text
+
+    a1 = client.post("/ask", json={"question": "distinct animal in zoo"}, headers=h).json()
+    assert a1["rows"][0]["n"] == 1  # feline collapsed into cat
+
+
+def test_apply_rule_invalid_is_rejected_and_changes_nothing():
+    app, client = _client()
+    sid = _new_session(client)
+    h = {"X-Session-Id": sid}
+    client.post("/upload", files=[("files", ("zoo.csv", _ZOO_CSV, "text/csv"))], headers=h)
+
+    bad = client.post(
+        "/apply-rules",
+        json={"rules": [{"type": "force_type", "column": "score", "params": {"dtype": "banana"}}]},
+        headers=h,
+    )
+    assert bad.status_code == 400, bad.text
+    # nothing applied — the column is still numeric
+    sc = client.get("/schema", headers=h).json()
+    zoo = next(t for t in sc["tables"] if t["name"] == "zoo")
+    assert next(c for c in zoo["columns"] if c["name"] == "score")["dtype"] == "numeric"
+
+
+def test_raw_tables_retained_in_memory_and_wiped_on_close():
+    """The raw frames live in the session (in-memory, never a disk file) and are wiped
+    on session close — the ephemeral guarantee covers them like the cleaned tables."""
+    app, client = _client()
+    sid = _new_session(client)
+    h = {"X-Session-Id": sid}
+    client.post("/upload", files=[("files", ("zoo.csv", _ZOO_CSV, "text/csv"))], headers=h)
+
+    sess = app.state.store._sessions[sid]
+    assert sess.db_location == IN_MEMORY                 # never a disk path
+    assert "zoo" in sess.raw_tables and len(sess.raw_tables["zoo"]) == 3
+
+    client.delete("/session", headers=h)                # explicit wipe
+    assert sess.closed is True
+    assert sess.raw_tables == {} and sess.tables == {}  # raw frames gone too
+
+
+# ── 6e. RE-UPLOAD WARNS WHEN IT WOULD DISCARD MANUAL JOINS ───────────────────────
+
+def test_reupload_warns_only_when_manual_joins_would_be_lost():
+    app, client = _client(nl2sql=lambda q: _MANUAL_JOIN_SQL)
+    sid = _new_session(client)
+    h = {"X-Session-Id": sid}
+
+    # first upload: no contract/manual joins yet → no warning
+    up1 = client.post(
+        "/upload",
+        files=[
+            ("files", ("depts.csv", _DEPTS_CSV, "text/csv")),
+            ("files", ("staff.csv", _STAFF_CSV, "text/csv")),
+        ],
+        headers=h,
+    )
+    assert up1.status_code == 200, up1.text
+    assert up1.json()["warnings"] == []
+
+    # define a manual join (lives only on the cached contract)
+    cs = client.post(
+        "/confirm-schema",
+        json={"manual_relationships": [
+            {"from_table": "staff", "from_col": "team", "to_table": "depts", "to_col": "k"}
+        ]},
+        headers=h,
+    )
+    assert cs.status_code == 200, cs.text
+
+    # re-upload: the rebuild discards the manual join → a clear, non-silent warning
+    up2 = client.post(
+        "/upload",
+        files=[("files", ("zoo.csv", _ZOO_CSV, "text/csv"))],
+        headers=h,
+    )
+    assert up2.status_code == 200, up2.text
+    warnings = up2.json()["warnings"]
+    assert len(warnings) == 1
+    assert "manually-defined join" in warnings[0]
+    assert "staff.team" in warnings[0] and "depts.k" in warnings[0]
+
+    # a further re-upload now has no manual joins left to lose → no warning
+    up3 = client.post(
+        "/upload",
+        files=[("files", ("zoo.csv", _ZOO_CSV, "text/csv"))],
+        headers=h,
+    )
+    assert up3.json()["warnings"] == []
+
+
 # ── 7. UNKNOWN SESSION ────────────────────────────────────────────────────────────
 
 def test_unknown_session_is_404():

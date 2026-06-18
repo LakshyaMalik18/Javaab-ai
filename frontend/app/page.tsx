@@ -13,7 +13,7 @@ const NodeNetwork = dynamic(() => import("@/components/NodeNetwork"), {
   ssr: false,
 });
 import TrustStrip from "@/components/TrustStrip";
-import { Chip } from "@/components/ui";
+import { Chip, Reveal } from "@/components/ui";
 import { stagger, fadeUp, EASE } from "@/lib/motion";
 import CleanSetPiece from "@/components/setpieces/CleanSetPiece";
 import SchemaLabelSetPiece from "@/components/setpieces/SchemaLabelSetPiece";
@@ -22,10 +22,33 @@ import QuestionAnswerSetPiece from "@/components/setpieces/QuestionAnswerSetPiec
 import { RAW_ROWS } from "@/lib/mock";
 
 const CHIPS = [
-  "Privacy-first",
+  "Privacy mode, built in",
   "Multi-file JOINs in English",
   "Schema it understands",
   "Answers, not jargon",
+];
+
+const ROADMAP = [
+  {
+    title: "Currency parsing",
+    body: "Strip $, €, ₹ and thousands separators into clean, comparable numbers — automatically.",
+  },
+  {
+    title: "More data sources",
+    body: "Connect SQL Server, Snowflake and Databricks, and ask your warehouse questions in plain English.",
+  },
+  {
+    title: "Advanced cleaning rules",
+    body: "Regex find-and-replace, custom date formats, and exclude-a-column — right inside the cleaning report.",
+  },
+  {
+    title: "Bulk dictionary upload",
+    body: "Drop in a data dictionary and label every column at once, instead of one description at a time.",
+  },
+  {
+    title: "Abbreviation & synonym mapping",
+    body: "Teach Javaab your shorthand — “rev”, “QTD”, “NB” — so it speaks your team's language.",
+  },
 ];
 
 export default function MarketingPage() {
@@ -102,9 +125,9 @@ export default function MarketingPage() {
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ delay: 1.6, duration: 0.8, ease: EASE }}
                 >
-                  Privacy-first, executive-grade analytics in plain English. Drop in
-                  messy files — Javaab cleans them, understands the schema, joins
-                  them, and answers like a human.
+                  Executive-grade analytics in plain English, with Privacy Mode
+                  built in. Drop in messy files — Javaab cleans them, understands
+                  the schema, joins them, and answers like a human.
                 </motion.p>
 
                 <motion.div
@@ -167,7 +190,7 @@ export default function MarketingPage() {
           <Stage
             label="Engine 1 · Cleaning"
             title="Watch it fix itself."
-            kicker="Deterministic, reversible, transparent. The LLM never touches a raw cell — this is pure Python you can audit, and every change is logged for one-click undo."
+            kicker="Deterministic and transparent. The LLM never touches a raw cell — this is pure Python you can audit, and every change is logged with before/after samples so you can see exactly what happened."
             pin
             pinLength={0.6}
           >
@@ -206,8 +229,8 @@ export default function MarketingPage() {
           {/* ───────── TRUST ───────── */}
           <Stage
             label="Proof, not promises"
-            title="Every claim, a real number."
-            kicker="These tick from real logs in the app — destructive SQL is blocked 100% of the time, and nothing you upload survives your session."
+            title="Every claim, verifiable."
+            kicker="No vanity metrics — just what's true. Destructive SQL is blocked, answers come from a real database, and nothing you upload survives your session. The live guardrail counter runs inside the app."
           >
             <TrustStrip />
           </Stage>
@@ -223,14 +246,17 @@ export default function MarketingPage() {
               viewport={{ once: true }}
             >
               <h2 className="display text-[clamp(2rem,5vw,3.4rem)] text-ink">
-                Your data leaves no trace.
+                Privacy mode, built in.
               </h2>
               <p className="mx-auto mt-6 max-w-2xl text-[15px] leading-relaxed text-graphite">
-                Your uploaded data lives in memory only for your session and is wiped
-                when you leave. Questions and small data samples are sent to the model
-                provider to generate SQL and insights. We default to Groq, whose policy
-                is not to retain inference data. Optionally switch to Gemini with your
-                own API key. Privacy Mode forces Groq and minimizes what's sent.
+                By default — every user, every session — your data is ephemeral: it
+                lives in memory only, nothing is ever written to disk, and everything
+                is wiped the moment you leave. To generate SQL and insights, your
+                questions and small samples of your data are sent to a model provider;
+                by default that&apos;s Gemini. Want provider-level no-retention too?
+                Turn on Privacy Mode to route everything through Groq (no-retention) —
+                the default Gemini provider is never called. Or bring your own Gemini
+                key for maximum accuracy.
               </p>
               <div className="mt-10 flex flex-wrap items-center justify-center gap-4">
                 <Link
@@ -250,6 +276,27 @@ export default function MarketingPage() {
               </div>
             </motion.div>
           </section>
+
+          {/* ───────── ROADMAP ───────── */}
+          <Stage
+            label="What's next"
+            title="The roadmap."
+            kicker="Javaab is sharp today — and getting sharper. A few of the things we're building next."
+          >
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {ROADMAP.map((r, i) => (
+                <Reveal key={r.title} delay={i * 0.06}>
+                  <div className="glass-strong h-full rounded-2xl p-6 shadow-glass">
+                    <Chip>Coming soon</Chip>
+                    <h3 className="display mt-4 text-[20px] text-ink">{r.title}</h3>
+                    <p className="mt-2 text-[14px] leading-relaxed text-graphite">
+                      {r.body}
+                    </p>
+                  </div>
+                </Reveal>
+              ))}
+            </div>
+          </Stage>
 
           {/* ───────── FOOTER ───────── */}
           <footer className="border-t border-[var(--hairline)] px-6 py-10 sm:px-10">

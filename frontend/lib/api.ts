@@ -193,6 +193,8 @@ export interface UploadReport {
   duplicates: DuplicateGroup[];
   ambiguity: AmbiguityFlag[];
   errors: string[];
+  // non-fatal notices, e.g. "re-uploading reset your manual joins" — shown to the user
+  warnings: string[];
 }
 
 interface RawUploadResponse {
@@ -204,6 +206,7 @@ interface RawUploadResponse {
   };
   flags: Array<Record<string, unknown>>;
   errors: string[];
+  warnings?: string[];
 }
 
 function normalizeUpload(raw: RawUploadResponse): UploadReport {
@@ -279,6 +282,7 @@ function normalizeUpload(raw: RawUploadResponse): UploadReport {
     duplicates,
     ambiguity,
     errors: raw.errors || [],
+    warnings: raw.warnings || [],
   };
 }
 
@@ -294,6 +298,53 @@ export async function uploadFiles(
     body: form,
   });
   return normalizeUpload(raw);
+}
+
+// ── Custom cleaning rules ────────────────────────────────────────────────────
+export type CleaningRuleType = "null_token" | "force_type" | "merge_values";
+
+export interface CleaningRule {
+  type: CleaningRuleType;
+  column: string;
+  table?: string | null;
+  params: Record<string, unknown>;
+}
+
+// Re-runs cleaning on the retained raw data with the user's rules; returns the same
+// report shape as /upload (so the cleaning step re-renders from one normalizer).
+export async function applyRules(
+  sessionId: string,
+  rules: CleaningRule[],
+): Promise<UploadReport> {
+  const raw = await request<RawUploadResponse>("/apply-rules", {
+    method: "POST",
+    sessionId,
+    json: { rules },
+  });
+  return normalizeUpload(raw);
+}
+
+// ── Resolve duplicates ───────────────────────────────────────────────────────
+export interface DuplicateDecision {
+  table: string;
+  row_indices: number[];
+  action: "keep" | "remove";
+}
+
+export interface ResolveDuplicatesResult {
+  removed_rows: number;
+  tables: TableMeta[];
+}
+
+export function resolveDuplicates(
+  sessionId: string,
+  decisions: DuplicateDecision[],
+): Promise<ResolveDuplicatesResult> {
+  return request<ResolveDuplicatesResult>("/resolve-duplicates", {
+    method: "POST",
+    sessionId,
+    json: { decisions },
+  });
 }
 
 // ── Schema ───────────────────────────────────────────────────────────────────
@@ -324,12 +375,17 @@ export interface RelationshipChoice {
   to_col: string;
 }
 
+// A user-defined join. Same shape as a choice; the backend validates it exists,
+// persists it, and makes it the active link for its table-pair.
+export type ManualRelationship = RelationshipChoice;
+
 export function confirmSchema(
   sessionId: string,
   body: {
     column_edits?: ColumnEdit[];
     data_dictionary?: DataDictionaryEntry[];
     relationship_choices?: RelationshipChoice[];
+    manual_relationships?: ManualRelationship[];
   },
 ): Promise<SchemaContract & { applied?: string[] }> {
   return request("/confirm-schema", {
@@ -339,6 +395,7 @@ export function confirmSchema(
       column_edits: body.column_edits || [],
       data_dictionary: body.data_dictionary || [],
       relationship_choices: body.relationship_choices || [],
+      manual_relationships: body.manual_relationships || [],
     },
   });
 }

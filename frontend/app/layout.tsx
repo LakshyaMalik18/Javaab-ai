@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Javaab — The analyst in your pocket",
   description:
-    "Privacy-first, executive-grade natural-language analytics. Clean messy data, understand your schema, join files in plain English, get answers — not jargon.",
+    "Executive-grade natural-language analytics with Privacy Mode built in. Clean messy data, understand your schema, join files in plain English, get answers — not jargon.",
 };
 
 export const viewport: Viewport = {

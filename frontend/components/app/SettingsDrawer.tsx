@@ -186,14 +186,14 @@ function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
   return (
     <button
       onClick={onClick}
-      className={`relative h-6 w-11 rounded-full transition ${
+      className={`relative h-6 w-11 shrink-0 rounded-full transition ${
         on ? "bg-indigo-glow shadow-glow" : "bg-white/15"
       }`}
     >
       <motion.span
-        layout
-        className="absolute top-0.5 h-5 w-5 rounded-full bg-white"
-        animate={{ left: on ? 22 : 2 }}
+        className="absolute left-0 top-0.5 h-5 w-5 rounded-full bg-white"
+        animate={{ x: on ? 22 : 2 }}
+        transition={{ type: "spring", stiffness: 500, damping: 32 }}
       />
     </button>
   );

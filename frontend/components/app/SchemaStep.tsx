@@ -66,8 +66,8 @@ export default function SchemaStep({ onNext }: { onNext: () => void }) {
           Confirm what it means.
         </h1>
         <p className="mt-2 text-[15px] text-graphite">
-          Edit any type or meaning. Low-confidence columns glow — answer the
-          question, add a description, or upload a data dictionary.
+          Edit any type or meaning. Low-confidence columns glow — answer its
+          question, or type a description to tell Javaab what the column means.
         </p>
       </header>
 
@@ -212,12 +212,9 @@ function SchemaRow({
                   setDescLocal(e.target.value);
                   onDesc(e.target.value);
                 }}
-                placeholder="add a description…"
+                placeholder="describe what this column means…"
                 className="flex-1 rounded-md border border-[var(--hairline)] bg-obsidian-700 px-2 py-1 text-[12px] text-ink placeholder:text-graphite/60"
               />
-              <button className="rounded-md border border-[var(--hairline)] px-2 py-1 text-[11px] text-graphite transition hover:text-ink">
-                Upload dictionary
-              </button>
             </div>
           </div>
         )}

@@ -21,8 +21,9 @@ interface Pair {
 export default function GraphStep({ onNext }: { onNext: () => void }) {
   const { schema, confirmSchema } = useAppData();
   const discovered = useMemo(() => schema?.relationships ?? [], [schema]);
-  // Manually-defined joins live in local state — there is no backend persistence
-  // endpoint for relationships, so they are surfaced here as local-only candidates.
+  // Manually-defined joins live in local state until the user confirms; on confirm,
+  // any that are the active link for their pair are persisted to the backend (see
+  // confirmAndNext) so they become real, query-time relationships.
   const [manual, setManual] = useState<RelationshipEdge[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -87,24 +88,32 @@ export default function GraphStep({ onNext }: { onNext: () => void }) {
   };
 
   const confirmAndNext = async () => {
-    // persist exactly one active link per pair; only DISCOVERED edges go to the
-    // backend (manual edges are local-only — there's no persistence endpoint yet).
+    // Persist exactly one active link per pair. A discovered active edge is sent as a
+    // relationship_choice; a user-defined active edge is sent as a manual_relationship
+    // — the backend validates it, persists it, and makes it the pair's active link, so
+    // it flows into the same machinery (nl2sql + join-path + guardrail) as a discovered
+    // join. An invalid manual join is rejected server-side and we stay on this step.
     const discoveredIds = new Set(discovered.map(edgeId));
-    const choices: RelationshipChoice[] = pairs
-      .map((p) => activeEdge(p))
-      .filter((e) => discoveredIds.has(edgeId(e)))
-      .map((e) => ({
-        from_table: e.from_table,
-        from_col: e.from_col,
-        to_table: e.to_table,
-        to_col: e.to_col,
-      }));
+    const toChoice = (e: RelationshipEdge): RelationshipChoice => ({
+      from_table: e.from_table,
+      from_col: e.from_col,
+      to_table: e.to_table,
+      to_col: e.to_col,
+    });
+    const activeEdges = pairs.map((p) => activeEdge(p));
+    const choices = activeEdges.filter((e) => discoveredIds.has(edgeId(e))).map(toChoice);
+    const manualRels = activeEdges
+      .filter((e) => !discoveredIds.has(edgeId(e)))
+      .map(toChoice);
+
     setSaving(true);
+    let ok = true;
     try {
-      if (choices.length) await confirmSchema([], [], choices);
+      if (choices.length || manualRels.length)
+        ok = await confirmSchema([], [], choices, manualRels);
     } finally {
       setSaving(false);
-      onNext();
+      if (ok) onNext();
     }
   };
 

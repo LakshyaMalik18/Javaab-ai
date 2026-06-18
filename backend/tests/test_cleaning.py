@@ -348,3 +348,156 @@ def test_12_latin1_csv_loads():
     df = result["df"]
     assert len(df) == 2
     assert "id" in df.columns
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON nested arrays — flatten to text, one row per record (regression)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_json_nested_array_flattened_to_text():
+    """A JSON array field is preserved as comma-joined text in one cell — not
+    dropped, and not exploded into extra rows."""
+    from app.upload_pipeline import process_upload
+
+    raw = json.dumps([
+        {"id": 1, "amount": 100, "tags": ["urgent", "vip"]},
+        {"id": 2, "amount": 200, "tags": ["c"]},
+    ]).encode()
+    result = process_upload([("orders.json", raw)])
+
+    assert result.errors == []
+    df = result.tables["orders"]
+    # row count unchanged — no explosion, no dropped rows
+    assert len(df) == 2
+    # array became a text column with comma-joined values
+    assert df["tags"].tolist() == ["urgent, vip", "c"]
+
+
+def test_json_nested_array_does_not_crash_cleaning():
+    """Regression: a list cell used to raise in the cleaning engine
+    (pd.isna on a list). Ingest+clean must now complete cleanly."""
+    from app.upload_pipeline import process_upload
+
+    raw = json.dumps([{"id": 1, "roles": ["a", "b", "c"]}]).encode()
+    result = process_upload([("r.json", raw)])
+    assert result.errors == []
+    assert result.tables["r"]["roles"].tolist() == ["a, b, c"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-file error isolation — one bad file must not sink the batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_bad_file_does_not_crash_multifile_upload():
+    """A genuinely unprocessable file fails gracefully with a per-file message
+    while the other files in the same batch still process."""
+    from app.upload_pipeline import process_upload
+
+    good = b"name,score\nAl,10\nBo,20"
+    broken = b"{ this is not valid json"
+    result = process_upload([("good.csv", good), ("broken.json", broken)])
+
+    # the good file made it through
+    assert "good" in result.tables
+    assert len(result.tables["good"]) == 2
+    # the bad file produced a clear, named error rather than crashing
+    assert any("broken.json" in e for e in result.errors)
+
+
+def test_cleaning_stage_failure_is_isolated(monkeypatch):
+    """The widened error boundary: a failure inside cleaning (not just ingest)
+    is caught per-table, so other tables in the batch still complete."""
+    from app import upload_pipeline
+    from app.engines import cleaning as cleaning_mod
+
+    real_clean = cleaning_mod.clean
+
+    def boom(df, table_name="data", **kwargs):
+        if table_name == "bad":
+            raise RuntimeError("simulated cleaning explosion")
+        return real_clean(df, table_name=table_name, **kwargs)
+
+    monkeypatch.setattr(upload_pipeline.cleaning_mod, "clean", boom)
+
+    good = b"name,score\nAl,10\nBo,20"
+    bad = b"a,b\n1,2"
+    result = upload_pipeline.process_upload([("good.csv", good), ("bad.csv", bad)])
+
+    # good table survived; bad table was isolated with a named error
+    assert "good" in result.tables
+    assert "bad" not in result.tables
+    assert any("bad" in e and "could not process" in e for e in result.errors)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Excel formula columns — read cached values; warn (don't silently drop) when none
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_formula_xlsx(with_cache: bool) -> bytes:
+    """An xlsx whose C column is a formula (=A*B). openpyxl never computes
+    formulas, so `with_cache` injects cached <v> results into the sheet XML to
+    simulate a file that was opened/saved in Excel."""
+    import io
+    import zipfile
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"], ws["B1"], ws["C1"] = "qty", "price", "total"
+    ws["A2"], ws["B2"], ws["C2"] = 3, 2.5, "=A2*B2"
+    ws["A3"], ws["B3"], ws["C3"] = 4, 1.0, "=A3*B3"
+    buf = io.BytesIO()
+    wb.save(buf)
+    data = buf.getvalue()
+    if not with_cache:
+        return data
+
+    zin = zipfile.ZipFile(io.BytesIO(data))
+    items = {n: zin.read(n) for n in zin.namelist()}
+    sheet = next(n for n in items if n.startswith("xl/worksheets/sheet"))
+    xml = items[sheet].decode()
+    xml = xml.replace("<f>A2*B2</f>", "<f>A2*B2</f><v>7.5</v>")
+    xml = xml.replace("<f>A3*B3</f>", "<f>A3*B3</f><v>4</v>")
+    items[sheet] = xml.encode()
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, b in items.items():
+            z.writestr(n, b)
+    return out.getvalue()
+
+
+def test_excel_formula_cached_values_imported():
+    """A formula column with cached results imports those values as normal data."""
+    result = ingest_excel(_build_formula_xlsx(with_cache=True))
+    sheet = result["Sheet1"]
+    df = sheet["df"]
+    assert "total" in df.columns           # column NOT dropped
+    assert df["total"].tolist() == ["7.5", "4"]
+    assert sheet["warnings"] == []         # nothing to warn about
+
+
+def test_excel_formula_without_cache_warns_not_dropped():
+    """A formula column with no cached value produces a warning instead of being
+    silently dropped — naming the column so the loss is visible."""
+    result = ingest_excel(_build_formula_xlsx(with_cache=False))
+    sheet = result["Sheet1"]
+    # the non-formula columns still import fine
+    assert "qty" in sheet["df"].columns and "price" in sheet["df"].columns
+    # and the unreadable formula column is reported, not lost in silence
+    assert len(sheet["warnings"]) == 1
+    assert "total" in sheet["warnings"][0]
+
+
+def test_excel_formula_warning_surfaces_through_upload():
+    """The ingest warning rides the UploadResult.warnings channel end-to-end."""
+    from app.upload_pipeline import process_upload
+
+    up = process_upload([("book.xlsx", _build_formula_xlsx(with_cache=False))])
+    assert any("total" in w for w in up.warnings)
+    # cached version: clean import, no warning
+    up2 = process_upload([("book.xlsx", _build_formula_xlsx(with_cache=True))])
+    assert up2.warnings == []
+    # the cleaning engine coerces the imported formula results to numbers
+    assert up2.tables["sheet1"]["total"].tolist() == [7.5, 4.0]

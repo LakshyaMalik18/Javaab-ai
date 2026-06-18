@@ -153,6 +153,10 @@ def answer(
         return _generate_and_run(
             question, tables, contract, relevant, provider,
             metrics=metrics, max_rows=max_rows, con=con,
+            # On a model decline, forward any concrete runnable alternative it offered
+            # (e.g. "drop buy records" → "show the buy records") as proposed_action so
+            # the UI's "Yes — run it" chip re-submits it. None when the model offered
+            # no actionable alternative (e.g. "which column?") → no chip renders.
             on_no_sql=lambda nl: AnswerResult(
                 status="clarify",
                 question=question,
@@ -161,6 +165,7 @@ def answer(
                     nl.clarifying_question
                     or "I need more detail to answer that accurately. Can you clarify?"
                 ),
+                proposed_action=nl.proposed_action,
             ),
         )
     except Exception as e:  # absolute backstop — never let it escape

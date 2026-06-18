@@ -185,6 +185,42 @@ class SchemaContract(BaseModel):
         target.active = True
         return True
 
+    def add_manual_relationship(
+        self, from_table: str, from_col: str, to_table: str, to_col: str
+    ) -> bool:
+        """Add a user-defined join as a real relationship and make it the single
+        active link for its table-pair (so it flows into the nl2sql prompt, the
+        join-path walk, and the guardrail whitelist exactly like a discovered edge).
+
+        VALIDATED before anything is persisted: both tables and both columns must
+        exist and the two tables must differ (single-column cross-table join only).
+        Returns False — adding nothing — when invalid, so the caller can reject it.
+        An identical existing edge is reused rather than duplicated."""
+        if from_table == to_table:
+            return False
+        tbl_from, tbl_to = self.table(from_table), self.table(to_table)
+        if tbl_from is None or tbl_to is None:
+            return False
+        if tbl_from.column(from_col) is None or tbl_to.column(to_col) is None:
+            return False
+
+        exists = any(
+            (e.from_table, e.from_col, e.to_table, e.to_col)
+            == (from_table, from_col, to_table, to_col)
+            for e in self.relationships
+        )
+        if not exists:
+            self.relationships.append(
+                RelationshipEdge(
+                    from_table=from_table, from_col=from_col,
+                    to_table=to_table, to_col=to_col,
+                    confidence=1.0, confidence_label="high",
+                    provisional=False, active=False,
+                )
+            )
+        # make it the pair's one active link (deactivates any discovered alternative)
+        return self.set_active_link(from_table, from_col, to_table, to_col)
+
     def provisional_columns(self) -> list[tuple[str, str]]:
         return [
             (t.name, c.name)
@@ -200,6 +236,11 @@ class NL2SQLResult(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
     needs_clarification: bool = False
     clarifying_question: str | None = None
+    #: when the model declines (needs_clarification) but offers a concrete, runnable
+    #: alternative ("I can't drop records — want me to SELECT them instead?"), its
+    #: single best-guess restated as a question the "Yes — run it" chip re-submits.
+    #: None when the clarify has no actionable alternative (e.g. "which column?").
+    proposed_action: str | None = None
 
 
 class MappingFilter(BaseModel):

@@ -48,7 +48,16 @@ interface AppData {
     edits: api.ColumnEdit[],
     dict: api.DataDictionaryEntry[],
     relationshipChoices?: api.RelationshipChoice[],
+    manualRelationships?: api.ManualRelationship[],
   ) => Promise<boolean>;
+
+  // cleaning — explicit duplicate removal (returns rows actually removed, or null on error)
+  resolveDuplicates: (
+    decisions: api.DuplicateDecision[],
+  ) => Promise<number | null>;
+
+  // cleaning — add custom rules; re-runs cleaning from raw and refreshes the report
+  applyRules: (rules: api.CleaningRule[]) => Promise<boolean>;
 
   // ask
   ask: (question: string) => Promise<AnswerResult>;
@@ -209,12 +218,54 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
         if (r.errors.length) {
           toast("Some files had issues: " + r.errors.join("; "), "info");
         }
+        // re-upload may have reset manually-defined joins — tell the user, don't drop silently
+        for (const w of r.warnings) toast(w, "info");
         return true;
       } catch (e) {
         toast(e instanceof ApiError ? e.message : "Upload failed.");
         return false;
       } finally {
         setUploading(false);
+      }
+    },
+    [sessionId, toast],
+  );
+
+  const resolveDuplicates = useCallback(
+    async (decisions: api.DuplicateDecision[]): Promise<number | null> => {
+      if (!sessionId) {
+        toast("Session isn't ready yet — give it a second.");
+        return null;
+      }
+      // nothing to remove → no backend call, report zero removed
+      if (!decisions.some((d) => d.action === "remove")) return 0;
+      try {
+        const res = await api.resolveDuplicates(sessionId, decisions);
+        return res.removed_rows;
+      } catch (e) {
+        toast(e instanceof ApiError ? e.message : "Couldn't remove the duplicates.");
+        return null;
+      }
+    },
+    [sessionId, toast],
+  );
+
+  const applyRules = useCallback(
+    async (rules: api.CleaningRule[]): Promise<boolean> => {
+      if (!sessionId) {
+        toast("Session isn't ready yet — give it a second.");
+        return false;
+      }
+      try {
+        const r = await api.applyRules(sessionId, rules);
+        setReport(r); // re-render the cleaning report on the freshly-cleaned data
+        setSchema(null); // a re-clean changes the data → any prior schema is stale
+        // applying a rule rebuilds the contract — warn if it reset manual joins
+        for (const w of r.warnings) toast(w, "info");
+        return true;
+      } catch (e) {
+        toast(e instanceof ApiError ? e.message : "Couldn't apply that rule.");
+        return false;
       }
     },
     [sessionId, toast],
@@ -245,12 +296,14 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       edits: api.ColumnEdit[],
       dict: api.DataDictionaryEntry[],
       relationshipChoices: api.RelationshipChoice[] = [],
+      manualRelationships: api.ManualRelationship[] = [],
     ): Promise<boolean> => {
       console.log("[confirmSchema] called", {
         sessionId,
         edits: edits.length,
         dict: dict.length,
         relationshipChoices: relationshipChoices.length,
+        manualRelationships: manualRelationships.length,
       });
       if (!sessionId) {
         console.warn("[confirmSchema] no sessionId — bailing");
@@ -261,6 +314,7 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
           column_edits: edits,
           data_dictionary: dict,
           relationship_choices: relationshipChoices,
+          manual_relationships: manualRelationships,
         });
         console.log("[confirmSchema] API ok", s);
         setSchema(s);
@@ -341,6 +395,8 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
         schemaError,
         loadSchema,
         confirmSchema,
+        resolveDuplicates,
+        applyRules,
         ask,
         primaryProvider,
         activeProvider,

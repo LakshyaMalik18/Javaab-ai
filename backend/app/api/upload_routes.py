@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from app.api._serialize import clean_json
 from app.api.deps import get_session
-from app.session import Session
+from app.session import Session, manual_join_reset_warning
 from app.upload_pipeline import process_upload
 
 router = APIRouter(tags=["upload"])
@@ -31,8 +31,17 @@ async def upload(
             )
         payloads.append((name, await f.read()))
 
+    # a re-upload rebuilds the contract → any user-defined manual joins on it are
+    # discarded. Capture them BEFORE load_upload wipes the contract so we can tell the
+    # user instead of dropping them silently. (Empty on a first upload — nothing to lose.)
+    warnings = manual_join_reset_warning(session.manual_join_labels(), "Re-uploading")
+
     up = process_upload(payloads)
     session.load_upload(up)
+
+    # ingest-time notices (e.g. an Excel formula column with no cached value) ride
+    # the same warnings channel as the manual-join reset notice.
+    warnings = warnings + up.warnings
 
     if not session.tables and up.errors:
         # every file failed — surface clearly, but don't 500
@@ -47,5 +56,6 @@ async def upload(
         },
         "flags": session.flags,
         "errors": session.errors,
+        "warnings": warnings,
     }
     return clean_json(report)

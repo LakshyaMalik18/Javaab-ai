@@ -5,7 +5,6 @@ import type {
   ChangeRecord,
   DuplicateGroup,
   AmbiguityFlag,
-  Metrics,
   SchemaContract,
 } from "./types";
 
@@ -327,13 +326,6 @@ export const MOCK_BLOCKED: AnswerResult = {
   columns: [],
   rows: [],
   tables_used: ["orders"],
-};
-
-export const MOCK_METRICS: Metrics = {
-  queries_answered: 1847,
-  destructive_blocked_pct: 100,
-  schema_accuracy_pct: 94,
-  bytes_retained: 0,
 };
 
 // Time-series + categorical sample for chart-type switching in chat

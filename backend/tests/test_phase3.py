@@ -283,6 +283,93 @@ def test_business_synonym_ambiguous_two_money_columns_clarifies():
     assert "amount" in res.clarifying_question and "refund_amount" in res.clarifying_question
 
 
+# ── 4c. CLARIFY-WITH-OFFER → proposed_action drives the "Yes — run it" chip ─────
+
+def _trades_contract_and_tables():
+    """A tiny trades schema with a buy_sell column so 'drop buy records' is a
+    Tier-1 hit (the 'buy' token matches the buy_sell column name)."""
+    cols = [
+        ColumnContract(name="trade_id", raw_name="trade_id", dtype="numeric", role="id", is_id=True),
+        ColumnContract(name="bond_id", raw_name="bond_id", dtype="text", role="dimension",
+                       meaning="bond identifier"),
+        ColumnContract(name="buy_sell", raw_name="buy_sell", dtype="text", role="dimension",
+                       meaning="trade side", sample_values=["BUY", "SELL"]),
+        ColumnContract(name="quantity", raw_name="quantity", dtype="numeric", role="measure"),
+    ]
+    data = {
+        "trade_id": [1, 2, 3, 4],
+        "bond_id": ["BOND1", "BOND1", "BOND2", "BOND2"],
+        "buy_sell": ["BUY", "SELL", "BUY", "SELL"],
+        "quantity": [10, 5, 7, 3],
+    }
+    contract = SchemaContract(tables=[TableContract(name="trades", row_count=4, columns=cols)])
+    return contract, {"trades": pd.DataFrame(data)}
+
+
+def test_clarify_with_offer_populates_proposed_action_and_reruns():
+    """The Tier-1 nl2sql-decline path: 'drop buy records' is not literally
+    destructive-SQL intent, so it reaches nl2sql, which declines (read-only) but
+    offers a concrete SELECT alternative. That alternative must be captured into
+    `proposed_action` (so the 'Yes — run it' chip renders), and re-submitting it
+    must run the safe SELECT."""
+    contract, tables = _trades_contract_and_tables()
+
+    # sanity: 'drop buy records' is NOT caught by the NL destructive-intent gate
+    # (only 'drop table/column/...' is) — so it genuinely flows into nl2sql.
+    from app.engines import guardrail as guardrail_mod
+    assert guardrail_mod.destructive_intent("drop buy records") is None
+    # and it IS a Tier-1 hit (the 'buy' token matches the buy_sell column)
+    rel = nl2sql_mod.select_relevant("drop buy records", contract)
+    assert rel.matched_anything
+
+    proposed = "show the records where buy_sell is BUY"
+
+    def _script(q: str) -> dict:
+        if "drop" in q.lower():
+            # model declines the destructive ask but offers a runnable alternative
+            return {
+                "sql": None, "tables_used": [], "assumptions": [],
+                "needs_clarification": True,
+                "clarifying_question": "I can't drop records — Javaab is read-only. "
+                                       "Want me to show the buy records instead?",
+                "proposed_action": proposed,
+            }
+        # the affirmative re-submit → a safe SELECT that actually runs
+        return {
+            "sql": "SELECT * FROM trades WHERE buy_sell = 'BUY'",
+            "tables_used": ["trades"], "assumptions": ["mapped 'buy' to buy_sell = 'BUY'"],
+            "needs_clarification": False, "clarifying_question": None,
+        }
+
+    mock = MockProvider(nl2sql=_script)
+
+    # 1. the clarify now carries the concrete runnable alternative
+    res = answer("drop buy records", tables, contract=contract, provider=mock)
+    assert res.status == "clarify"
+    assert res.sql is None
+    assert res.proposed_action == proposed  # ← the chip now renders
+
+    # 2. clicking "Yes — run it" re-submits proposed_action → safe SELECT runs
+    rerun = answer(res.proposed_action, tables, contract=contract, provider=mock)
+    assert rerun.status == "answered"
+    assert "buy_sell" in rerun.sql.lower()
+    assert len(rerun.rows) == 2  # the two BUY trades
+
+
+def test_clarify_without_concrete_alternative_has_no_proposed_action():
+    """A clarify that asks the user to PICK (no single runnable action) must leave
+    proposed_action None — so no 'Yes — run it' chip is faked where nothing runs."""
+    contract, tables = _trades_contract_and_tables()
+    mock = MockProvider(nl2sql=lambda q: {
+        "sql": None, "tables_used": [], "assumptions": [],
+        "needs_clarification": True,
+        "clarifying_question": "Do you mean BUY or SELL trades?",
+        "proposed_action": None})
+    res = answer("show me the trades", tables, contract=contract, provider=mock)
+    assert res.status == "clarify"
+    assert res.proposed_action is None  # ← deliberately no chip
+
+
 # ── 5. GUARDRAIL IS ALWAYS IN THE PATH ─────────────────────────────────────────
 
 def test_generated_sql_passes_through_guardrail_when_valid():
