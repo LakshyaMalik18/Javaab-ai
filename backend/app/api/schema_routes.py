@@ -75,6 +75,23 @@ def confirm_schema(body: ConfirmSchemaRequest, session: Session = Depends(get_se
             col.clarifying_question = None
             applied.append(f"{tbl.name}.{entry.column}")
 
+    # 3. relationship active-link choices — exactly one active edge per table-pair.
+    # Only the active link is used at query time (nl2sql prompt + guardrail), so this
+    # is the user's sole lever over joins. set_active_link enforces one-per-pair.
+    for choice in body.relationship_choices:
+        ok = contract.set_active_link(
+            choice.from_table, choice.from_col, choice.to_table, choice.to_col
+        )
+        if not ok:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"no discovered link {choice.from_table}.{choice.from_col} -> "
+                    f"{choice.to_table}.{choice.to_col} to activate"
+                ),
+            )
+        applied.append(f"join:{choice.from_table}~{choice.to_table}")
+
     payload = _contract_payload(session)
     payload["applied"] = applied
     return payload

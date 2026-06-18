@@ -70,6 +70,21 @@ export default function AnswerCard({
           {answer.clarifying_question ||
             "Could you rephrase that using the fields in your data?"}
         </p>
+        {/* Affirmative shortcut: the backend proposed a concrete reading on this
+            clarify, so "Yes — run it" re-asks that exact question (stateless). */}
+        {answer.proposed_action && (
+          <div className="mt-4">
+            <button
+              onClick={() => onFollowup(answer.proposed_action as string)}
+              className="rounded-full bg-amber-warm/20 px-4 py-1.5 text-[12.5px] font-medium text-amber-warm transition hover:bg-amber-warm/30"
+            >
+              Yes — run it ✓
+            </button>
+            <p className="mt-1.5 text-[11.5px] text-graphite">
+              Runs: “{answer.proposed_action}”
+            </p>
+          </div>
+        )}
         {answer.assumptions.length > 0 && (
           <div className="mt-4 flex flex-wrap gap-2">
             {answer.assumptions.map((a) => (
@@ -82,10 +97,16 @@ export default function AnswerCard({
             ))}
           </div>
         )}
-        {answer.followups.length > 0 && (
+        {/* Suggested questions (the "here are some questions I can answer"
+            chips) live in `suggestions` on a refusal — followups stays empty
+            here, so render both and let the user click one to re-ask. */}
+        {((answer.suggestions?.length ?? 0) > 0 || answer.followups.length > 0) && (
           <div className="mt-4 flex flex-wrap gap-2">
+            {(answer.suggestions ?? []).map((s) => (
+              <FollowupChip key={`s-${s}`} text={s} onClick={() => onFollowup(s)} />
+            ))}
             {answer.followups.map((f) => (
-              <FollowupChip key={f} text={f} onClick={() => onFollowup(f)} />
+              <FollowupChip key={`f-${f}`} text={f} onClick={() => onFollowup(f)} />
             ))}
           </div>
         )}
@@ -136,8 +157,11 @@ function AnsweredCard({
     (answer.chart_hint as ChartType) ?? "bar",
   );
   const [sqlOpen, setSqlOpen] = useState(false);
-  const xKey = answer.columns[0] ?? "x";
-  const yKey = answer.columns[1] ?? "y";
+  // Pick the measure (a numeric column) as the value axis, the first dimension as
+  // the x axis, and a SECOND dimension (if present) as the series. Without this a
+  // result like [buysell, bondid, total] would plot the bondid *dimension* as the
+  // value, which is the multi-dimension chart bug.
+  const { xKey, yKey, seriesKey } = deriveChartKeys(answer.columns, answer.rows);
 
   return (
     <motion.div
@@ -186,7 +210,13 @@ function AnsweredCard({
               ))}
             </select>
           </div>
-          <ResultChart type={chart} rows={answer.rows} xKey={xKey} yKey={yKey} />
+          <ResultChart
+            type={chart}
+            rows={answer.rows}
+            xKey={xKey}
+            yKey={yKey}
+            seriesKey={seriesKey}
+          />
         </div>
       )}
 
@@ -281,4 +311,35 @@ function fmt(v: string | number | null) {
   if (v === null) return "—";
   if (typeof v === "number") return v.toLocaleString();
   return v;
+}
+
+// A column is a measure (value axis) if every non-null cell is a number.
+function isNumericColumn(
+  rows: Record<string, string | number | null>[],
+  col: string,
+): boolean {
+  let seen = false;
+  for (const r of rows) {
+    const v = r[col];
+    if (v === null || v === undefined) continue;
+    if (typeof v !== "number") return false;
+    seen = true;
+  }
+  return seen;
+}
+
+// Derive { xKey (1st dimension), yKey (the measure), seriesKey (2nd dimension) }
+// so charts handle single- AND multi-dimension results correctly.
+function deriveChartKeys(
+  columns: string[],
+  rows: Record<string, string | number | null>[],
+): { xKey: string; yKey: string; seriesKey?: string } {
+  const numeric = columns.filter((c) => isNumericColumn(rows, c));
+  const dims = columns.filter((c) => !numeric.includes(c));
+  const xKey = dims[0] ?? columns[0] ?? "x";
+  const yKey =
+    numeric[numeric.length - 1] ?? columns[1] ?? columns[0] ?? "y";
+  const seriesKey =
+    rows.length > 0 && dims.length >= 2 ? dims[1] : undefined;
+  return { xKey, yKey, seriesKey };
 }

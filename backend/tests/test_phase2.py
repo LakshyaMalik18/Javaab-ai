@@ -80,6 +80,146 @@ def test_join_ignores_low_cardinality_noise():
     assert rels == [], f"flag column should not join, got {rels}"
 
 
+def test_measure_column_does_not_coincidentally_join_id_range():
+    """The number-column false positive (events/bonds shape):
+
+    `events.bondid` is a real FK into `bonds.bondid` and must survive. But
+    `bonds.frequency` and `bonds.monthssincecoupon` are *measures* whose small
+    integer domains happen to fall inside the contiguous `events.eventid` range
+    (1..N) — those coincidental overlaps must be dropped, not surfaced as joins.
+    """
+    nb, ne = 40, 200
+    bonds = pd.DataFrame({
+        "bondid": list(range(1, nb + 1)),                          # PK
+        "frequency": [[1, 2, 4, 12][i % 4] for i in range(nb)],    # measure
+        "monthssincecoupon": [i % 12 + 1 for i in range(nb)],      # measure
+    })
+    events = pd.DataFrame({
+        "eventid": list(range(1, ne + 1)),                 # contiguous id range / PK
+        "bondid": [(i % nb) + 1 for i in range(ne)],       # genuine FK -> bonds
+    })
+    tables = {"bonds": bonds, "events": events}
+    rels = J.discover_joins(tables, _profiled(tables))
+
+    def _pair(r):
+        return frozenset({(r["from_table"], r["from_col"]),
+                          (r["to_table"], r["to_col"])})
+
+    pairs = {_pair(r) for r in rels}
+    bondid = frozenset({("events", "bondid"), ("bonds", "bondid")})
+    freq = frozenset({("bonds", "frequency"), ("events", "eventid")})
+    msc = frozenset({("bonds", "monthssincecoupon"), ("events", "eventid")})
+
+    assert bondid in pairs, f"genuine bondid->bondid join lost: {rels}"
+    assert freq not in pairs, f"coincidental frequency->eventid surfaced: {rels}"
+    assert msc not in pairs, f"coincidental monthssincecoupon->eventid surfaced: {rels}"
+
+
+def test_text_dimension_column_does_not_coincidentally_join():
+    """The non-numeric coincidence (events/bonds shape):
+
+    `events.bondid` is a real, name-corroborated FK into `bonds.bondid`. But
+    `events.desk` is a *dimension* whose handful of values happen to be valid bond
+    ids — a coincidental containment with no naming relationship. It must be
+    demoted/dropped, leaving bondid->bondid as the only high-confidence option.
+    """
+    nb, ne = 40, 200
+    bond_ids = [f"BOND{i}" for i in range(1, nb + 1)]   # text PK
+    bonds = pd.DataFrame({
+        "bondid": bond_ids,
+        "name": [f"Bond {i}" for i in range(1, nb + 1)],
+    })
+    events = pd.DataFrame({
+        "eventid": list(range(1, ne + 1)),
+        "bondid": [bond_ids[i % nb] for i in range(ne)],            # genuine FK
+        # a low-cardinality desk label that, by luck, is always a real bond id
+        "desk": [bond_ids[i % 3] for i in range(ne)],              # dimension noise
+    })
+    tables = {"bonds": bonds, "events": events}
+    rels = J.discover_joins(tables, _profiled(tables))
+
+    by_pair = {
+        frozenset({(r["from_table"], r["from_col"]), (r["to_table"], r["to_col"])}): r
+        for r in rels
+    }
+    bondid = frozenset({("events", "bondid"), ("bonds", "bondid")})
+    desk = frozenset({("events", "desk"), ("bonds", "bondid")})
+
+    assert bondid in by_pair, f"genuine bondid->bondid join lost: {rels}"
+    assert by_pair[bondid]["confidence_label"] == "high"
+    assert desk not in by_pair, f"coincidental desk->bondid surfaced: {rels}"
+
+
+# --------------------------------------------------------------------------
+# Active-link selection (Part B): exactly one load-bearing link per table-pair,
+# and only that link is valid at query time.
+# --------------------------------------------------------------------------
+from app.models import RelationshipEdge, SchemaContract
+
+
+def _two_candidate_contract() -> SchemaContract:
+    """events↔bonds has two discovered candidates on the SAME pair: the genuine
+    bondid↔bondid (high) and a weaker bondid↔eventid alternative."""
+    return SchemaContract(relationships=[
+        RelationshipEdge(from_table="events", from_col="bondid",
+                         to_table="bonds", to_col="bondid",
+                         confidence=1.0, confidence_label="high"),
+        RelationshipEdge(from_table="bonds", from_col="bondid",
+                         to_table="events", to_col="eventid",
+                         confidence=0.97, confidence_label="high"),
+    ])
+
+
+def test_default_activation_one_per_pair_highest_confidence():
+    c = _two_candidate_contract()
+    c.default_activate_relationships()
+    active = c.active_relationships()
+    assert len(active) == 1, f"exactly one active link per pair, got {active}"
+    a = active[0]
+    assert (a.from_col, a.to_col) == ("bondid", "bondid")   # the highest-confidence one
+
+
+def test_set_active_link_switches_and_stays_single():
+    c = _two_candidate_contract()
+    c.default_activate_relationships()
+    ok = c.set_active_link("bonds", "bondid", "events", "eventid")
+    assert ok is True
+    active = c.active_relationships()
+    assert len(active) == 1, "still exactly one active after switching"
+    assert active[0].to_col == "eventid"
+
+
+def test_set_active_link_unknown_returns_false():
+    c = _two_candidate_contract()
+    c.default_activate_relationships()
+    assert c.set_active_link("bonds", "nope", "events", "eventid") is False
+
+
+def test_only_active_link_is_a_valid_join_key():
+    """The whole point: a join on the ACTIVE link passes the guard; a join on the
+    inactive (alternative) link is rejected as an invalid join key."""
+    c = _two_candidate_contract()
+    c.default_activate_relationships()  # active = events.bondid = bonds.bondid
+    schema = {"events": {"bondid", "eventid"}, "bonds": {"bondid", "name"}}
+
+    active_join = ("SELECT b.name FROM events e "
+                   "JOIN bonds b ON e.bondid = b.bondid")
+    inactive_join = ("SELECT b.name FROM bonds b "
+                     "JOIN events e ON b.bondid = e.eventid")
+
+    ok = G.validate_sql(active_join, schema, relationships=c.active_relationships())
+    assert ok.allowed is True, ok.reason
+
+    bad = G.validate_sql(inactive_join, schema, relationships=c.active_relationships())
+    assert bad.allowed is False
+    assert bad.kind == "invalid_join_key", bad.kind
+
+    # after the user switches the active link, the verdicts flip
+    c.set_active_link("bonds", "bondid", "events", "eventid")
+    flipped = G.validate_sql(inactive_join, schema, relationships=c.active_relationships())
+    assert flipped.allowed is True, flipped.reason
+
+
 # --------------------------------------------------------------------------
 # Guardrail — the §10 acceptance bar: 100% of destructive queries blocked
 # --------------------------------------------------------------------------

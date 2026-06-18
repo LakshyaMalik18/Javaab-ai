@@ -358,14 +358,20 @@ def test_analytical_questions_are_not_false_positively_blocked():
         assert res.status != "blocked", f"{q!r} was wrongly blocked"
 
 
-def test_guardrail_blocks_unknown_column():
+def test_guardrail_stops_unknown_column_but_does_not_label_it_blocked():
+    """An unknown column is hallucinated SQL: it must FAIL LOUD (never execute,
+    never return rows) — but it is NOT destructive intent, so it is routed to the
+    "couldn't map" refusal, not the "read-only by design" block."""
     tables, flags = _fixture_tables("02_join_pair")
     mock = MockProvider(nl2sql=lambda q: {
         "sql": "SELECT nonexistent_col FROM orders", "tables_used": ["orders"],
         "assumptions": [], "needs_clarification": False, "clarifying_question": None})
     res = answer("anything about orders amount", tables, provider=mock, flags=flags)
-    assert res.status == "blocked"
-    assert "unknown column" in res.blocked_reason
+    assert res.status == "refused"          # fail loud — not executed
+    assert res.blocked_reason is None       # NOT the destructive "read-only" block
+    assert not res.rows                      # never returned fabricated rows
+    assert "couldn't map" in res.clarifying_question.lower()
+    assert res.suggestions                   # helpful: real-schema questions offered
 
 
 # ── 6. END-TO-END (mocked) ─────────────────────────────────────────────────────
@@ -415,3 +421,341 @@ def test_run_query_basic():
     df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
     out = execute_mod.run_query({"t": df}, "SELECT SUM(a) AS s FROM t")
     assert out.iloc[0]["s"] == 6
+
+
+# ── 8. BUG FIXES: table-name consistency + fail-loud-but-helpful refusals ───────
+
+def test_table_name_flows_consistently_through_all_layers():
+    """Bug 1 regression: a messy filename must produce ONE sanitized table name
+    that is identical across DuckDB registration, the contract shown to the model,
+    and the guardrail's known-tables — and the model's SQL against that name runs."""
+    from app.upload_pipeline import process_upload, safe_table_name
+    up = process_upload([("Events 2024.csv", b"id,quantity\n1,10\n2,5\n")])
+    registered = set(up.tables)
+    contract = contract_mod.build_contract(
+        up.tables, GroqProvider(api_key=None), flags=up.flags,
+        profiles=up.profiles, relationships=up.relationships, skip_llm=True)
+    shown = {t.name for t in contract.tables}
+    known = set(contract.guardrail_schema())
+    assert registered == shown == known == {"events_2024"}  # never "events"/"events 2024"
+    assert safe_table_name("123 Q1!!") == "t_123_q1"          # leading digit + punctuation
+
+    mock = MockProvider(nl2sql=lambda q: {
+        "sql": "SELECT SUM(quantity) AS total FROM events_2024", "tables_used": ["events_2024"],
+        "assumptions": [], "needs_clarification": False, "clarifying_question": None})
+    res = answer("total quantity", up.tables, contract=contract, provider=mock)
+    assert res.status == "answered"
+    assert res.rows[0]["total"] == 15
+
+
+def test_unknown_table_fails_loud_as_couldnt_map_not_blocked():
+    """Hallucinated table (not in schema) must FAIL LOUD: never execute, never
+    return rows, and be labelled "couldn't map" — NOT the destructive read-only
+    block. This is the test that proves an unmapped table still refuses."""
+    tables, flags = _fixture_tables("02_join_pair")
+    mock = MockProvider(nl2sql=lambda q: {
+        "sql": "SELECT SUM(quantity) AS total_bonds_sold FROM events",  # 'events' doesn't exist
+        "tables_used": ["events"], "assumptions": [],
+        "needs_clarification": False, "clarifying_question": None})
+    res = answer("how many bonds were sold", tables, provider=mock, flags=flags)
+    assert res.status == "refused"            # fail loud — did NOT execute
+    assert res.blocked_reason is None         # NOT "read-only by design"
+    assert not res.rows                        # no fabricated rows
+    assert "couldn't map" in res.clarifying_question.lower()
+
+
+def test_suggested_questions_returned_on_unmappable_question():
+    """Bug 3: an unmappable question returns 3-4 suggestions built from the REAL
+    schema (actual table + column names), so the refusal is helpful, not a dead end."""
+    tables, flags = _fixture_tables("02_join_pair")
+    # gibberish that maps to nothing in the schema
+    res = answer("what is the airspeed velocity of an unladen swallow", tables,
+                 provider=MockProvider(), flags=flags)
+    assert res.status == "refused"
+    assert not res.rows
+    assert 1 <= len(res.suggestions) <= 4
+    # suggestions reference a real table name from the uploaded data
+    real_tables = set(tables)
+    assert any(any(t in s for t in real_tables) for s in res.suggestions)
+
+
+def test_destructive_block_still_labelled_read_only():
+    """Guard against over-correction: a genuine non-SELECT must STILL be a
+    destructive "read-only by design" block, not a "couldn't map" refusal."""
+    tables, flags = _fixture_tables("02_join_pair")
+    mock = MockProvider(nl2sql=lambda q: {
+        "sql": "DROP TABLE orders", "tables_used": ["orders"], "assumptions": [],
+        "needs_clarification": False, "clarifying_question": None})
+    res = answer("how many orders are there", tables, provider=mock, flags=flags)
+    assert res.status == "blocked"
+    assert res.blocked_reason
+    assert not res.suggestions
+
+
+# ── 9. INTERPRETATION LAYER (vague terms/values → real columns; net stays loud) ─
+
+_BONDS_CSV = (
+    b"Bond Trades Export,,,\n"                  # row 1: junk/banner — must be skipped
+    b"bond_id,buy_sell,quantity\n"              # row 2: the real header
+    b"BOND1,BUY,100\n"
+    b"BOND1,SELL,40\n"
+    b"BOND1,SELL,35\n"
+    b"BOND2,SELL,10\n"
+    b"BOND2,BUY,5\n"
+)
+
+
+def _events_bonds():
+    """Real upload (incl. the junk leading row) → (tables, deterministic contract).
+    Ground truth: BOND1 SELL quantity = 40+35 = 75; BOND2 SELL = 10; all SELL = 85."""
+    from app.upload_pipeline import process_upload
+    up = process_upload([("events.csv", _BONDS_CSV)])
+    contract = contract_mod.build_contract(
+        up.tables, GroqProvider(api_key=None), flags=up.flags,
+        profiles=up.profiles, relationships=up.relationships, skip_llm=True)
+    return up.tables, contract
+
+
+def test_junk_leading_row_skipped_real_header_detected():
+    """The bonds file's row 1 is junk (sparse banner); the real header is row 2.
+    Ingestion must skip the junk and read the true columns."""
+    tables, _ = _events_bonds()
+    df = tables["events"]
+    assert set(df.columns) == {"bond_id", "buy_sell", "quantity"}
+    assert "bond trades export" not in " ".join(df.columns).lower()
+    assert len(df) == 5  # 5 trade rows, no junk/header leakage
+
+
+_BONDS_REF_CSV = (
+    b",,,\n"                                            # row 1: junk (,,,) — skip it
+    b"BondID,Coupon,Frequency,MonthsSinceCoupon\n"      # row 2: the real header
+    b"BOND1,5.0,2,3\n"
+    b"BOND2,4.5,2,1\n"
+)
+
+
+def test_leading_junk_row_bonds_header_parsed_from_row_two():
+    """The tester's bonds file has a junk first row (,,,) before the real header.
+    Ingest must skip it and read BondID/Coupon/Frequency/MonthsSinceCoupon."""
+    from app.engines.ingest import ingest_csv
+    out = ingest_csv(_BONDS_REF_CSV, "bonds")
+    assert out["raw_headers"] == ["BondID", "Coupon", "Frequency", "MonthsSinceCoupon"]
+    assert set(out["df"].columns) == {"bondid", "coupon", "frequency", "monthssincecoupon"}
+    assert len(out["df"]) == 2  # two bond rows, junk row gone
+
+
+# helper: a confident, valid mapping the AI would propose for "how many bond1 sold"
+def _bond1_sold_mapping(_q):
+    return {
+        "tables": ["events"], "columns": ["quantity"],
+        "filters": [{"column": "bond_id", "op": "=", "value": "BOND1"},
+                    {"column": "buy_sell", "op": "=", "value": "SELL"}],
+        "aggregation": "SUM", "measure": "quantity", "group_by": [],
+        "confidence": "high", "alternatives": [], "unmappable": False,
+        "reason": "bond1->BondID='BOND1', sold->BuySell='SELL'"}
+
+
+def test_tier2_interprets_value_question_and_returns_ground_truth_75():
+    """Tier 1 misses "how many bond1 sold"; Tier 2 proposes a structured mapping
+    (bond1→BondID='BOND1', sold→BuySell='SELL', SUM quantity). The engine validates
+    it, runs the SQL, and returns the EXACT ground truth 40+35 = 75 — with the
+    interpretation surfaced for transparency."""
+    from app.engines.nl2sql import SYSTEM_TAG as NL2SQL_TAG
+    from app.engines.interpret import SYSTEM_TAG as INTERPRET_TAG
+    tables, contract = _events_bonds()
+
+    # Tier 1 genuinely misses (value-based phrasing) → Tier 2 fires
+    assert nl2sql_mod.select_relevant("how many bond1 sold", contract).matched_anything is False
+
+    mock = MockProvider(
+        mapping=_bond1_sold_mapping,
+        nl2sql=lambda q: {
+            "sql": "SELECT SUM(quantity) AS total_sold FROM events "
+                   "WHERE bond_id = 'BOND1' AND buy_sell = 'SELL'",
+            "tables_used": ["events"], "assumptions": [],
+            "needs_clarification": False, "clarifying_question": None})
+    res = answer("how many bond1 sold", tables, contract=contract, provider=mock)
+
+    assert res.status == "answered"
+    assert res.rows[0]["total_sold"] == 75            # EXACT ground truth
+    # transparency: the engine's vetted interpretation is shown in assumptions
+    assert any("Read as:" in a and "bond_id" in a and "buy_sell" in a for a in res.assumptions)
+    # the interpretation step actually saw the real columns + sample values
+    map_prompt = mock.calls_with(INTERPRET_TAG)[0][1]
+    assert "bond_id" in map_prompt and "buy_sell" in map_prompt
+    assert "BOND1" in map_prompt and "SELL" in map_prompt
+    assert mock.calls_with(NL2SQL_TAG)  # generation ran after the mapping was vetted
+
+
+def test_tier2_sell_percentage_interprets_buysell_correctly():
+    """A "what percentage were sold" question maps BuySell correctly. Ground truth:
+    SELL quantity = 40+35+10 = 85 of total 100+40+35+10+5 = 190 → 44.74%."""
+    tables, contract = _events_bonds()
+    mapping = {
+        "tables": ["events"], "columns": ["buy_sell", "quantity"], "filters": [],
+        "aggregation": "SUM", "measure": "quantity", "group_by": [],
+        "confidence": "high", "alternatives": [], "unmappable": False,
+        "reason": "share of quantity where buy_sell='SELL'"}
+    mock = MockProvider(
+        mapping=mapping,
+        nl2sql=lambda q: {
+            "sql": "SELECT ROUND(100.0 * SUM(CASE WHEN buy_sell = 'SELL' THEN quantity "
+                   "ELSE 0 END) / SUM(quantity), 2) AS sell_pct FROM events",
+            "tables_used": ["events"], "assumptions": ["computed SELL share of quantity"],
+            "needs_clarification": False, "clarifying_question": None})
+    res = answer("what percentage of bonds were sold", tables, contract=contract, provider=mock)
+    assert res.status == "answered"
+    assert res.rows[0]["sell_pct"] == 44.74        # EXACT ground truth
+
+
+def test_tier2_ambiguous_returns_clarify_and_runs_no_sql():
+    """Low confidence / two plausible readings → the engine must ASK, never let the
+    LLM silently pick, and NO SQL may run."""
+    from app.engines.nl2sql import SYSTEM_TAG as NL2SQL_TAG
+    tables, contract = _events_bonds()
+    ambiguous_mapping = {
+        "tables": ["events"], "columns": [], "filters": [],
+        "aggregation": None, "measure": None, "group_by": [],
+        "confidence": "low",
+        "alternatives": [{"term": "sold", "options": ["buy_sell", "trade_state"]}],
+        "unmappable": False, "reason": "'sold' is ambiguous"}
+
+    def _boom(q):
+        raise AssertionError("nl2sql/generation must NOT run for an ambiguous mapping")
+
+    mock = MockProvider(mapping=ambiguous_mapping, nl2sql=_boom)
+    res = answer("how many were sold", tables, contract=contract, provider=mock)
+    assert res.status == "clarify"
+    assert "sold" in res.clarifying_question and "buy_sell" in res.clarifying_question
+    assert not res.rows                                   # nothing ran
+    assert not mock.calls_with(NL2SQL_TAG)               # generation never happened
+
+
+def test_tier2_hallucinated_mapping_caught_by_revalidation_not_executed():
+    """If the AI proposes a column that doesn't exist, re-validation rejects it
+    BEFORE generation — it never reaches SQL or execution."""
+    from app.engines.nl2sql import SYSTEM_TAG as NL2SQL_TAG
+    tables, contract = _events_bonds()
+    hallucinated = {
+        "tables": ["events"], "columns": ["notional"],   # 'notional' is not a real column
+        "filters": [{"column": "bond_id", "op": "=", "value": "BOND1"}],
+        "aggregation": "SUM", "measure": "notional", "group_by": [],
+        "confidence": "high", "alternatives": [], "unmappable": False, "reason": "x"}
+
+    def _boom(q):
+        raise AssertionError("generation must NOT run for a hallucinated mapping")
+
+    mock = MockProvider(mapping=hallucinated, nl2sql=_boom)
+    res = answer("total notional for bond1", tables, contract=contract, provider=mock)
+    assert res.status == "refused"                        # fail loud
+    assert res.blocked_reason is None                     # not a destructive block
+    assert not res.rows                                   # never executed
+    assert not mock.calls_with(NL2SQL_TAG)               # rejected before generation
+
+
+def test_tier2_hallucinated_filter_value_caught_by_revalidation():
+    """A value-level filter whose value doesn't exist in the column is also caught
+    by re-validation (value-existence check) and never executed."""
+    tables, contract = _events_bonds()
+    bad_value = {
+        "tables": ["events"], "columns": ["quantity"],
+        "filters": [{"column": "bond_id", "op": "=", "value": "BOND9"}],  # no BOND9 in data
+        "aggregation": "SUM", "measure": "quantity", "group_by": [],
+        "confidence": "high", "alternatives": [], "unmappable": False, "reason": "x"}
+    res = answer("how many bond9 sold", tables, contract=contract,
+                 provider=MockProvider(mapping=bad_value, nl2sql=lambda q: {"sql": "x"}))
+    assert res.status == "refused"
+    assert not res.rows
+    assert "BOND9" in (res.clarifying_question or "")     # tells the user what was missing
+
+
+def test_tier2_unmappable_concept_fails_loud_with_suggestions():
+    """A concept with no matching column/value at all (profit, no cost column) →
+    the AI marks it unmappable, we refuse helpfully, nothing runs."""
+    from app.engines.nl2sql import SYSTEM_TAG as NL2SQL_TAG
+    tables, contract = _events_bonds()
+    unmappable = {"tables": [], "columns": [], "filters": [], "aggregation": None,
+                  "measure": None, "group_by": [], "confidence": "low",
+                  "alternatives": [], "unmappable": True,
+                  "reason": "no cost column exists, profit cannot be derived"}
+    mock = MockProvider(mapping=unmappable, nl2sql=lambda q: {"sql": "x"})
+    res = answer("what is the total profit", tables, contract=contract, provider=mock)
+    assert res.status == "refused"
+    assert not res.rows
+    assert res.suggestions and any("events" in s for s in res.suggestions)
+    assert not mock.calls_with(NL2SQL_TAG)
+
+
+def test_tier2_known_answer_batch_on_events_data():
+    """Ground-truth batch through the full Tier-2 path (valid mapping → generation →
+    execution). Asserts EXACT numbers, guarding against a wrong-column interpretation
+    giving a plausible-wrong answer."""
+    tables, contract = _events_bonds()
+    valid_mapping = {
+        "tables": ["events"], "columns": ["bond_id", "buy_sell", "quantity"],
+        "filters": [], "aggregation": "SUM", "measure": "quantity", "group_by": [],
+        "confidence": "high", "alternatives": [], "unmappable": False, "reason": "ok"}
+    cases = [
+        ("SELECT SUM(quantity) AS v FROM events WHERE bond_id='BOND1' AND buy_sell='SELL'", 75),
+        ("SELECT SUM(quantity) AS v FROM events WHERE buy_sell='SELL'", 85),
+        ("SELECT SUM(quantity) AS v FROM events WHERE bond_id='BOND2'", 15),
+        ("SELECT COUNT(*) AS v FROM events WHERE buy_sell='BUY'", 2),
+    ]
+    for sql, expected in cases:
+        mock = MockProvider(mapping=valid_mapping, nl2sql=lambda q, _sql=sql: {
+            "sql": _sql, "tables_used": ["events"], "assumptions": [],
+            "needs_clarification": False, "clarifying_question": None})
+        res = answer("ground truth question", tables, contract=contract, provider=mock)
+        assert res.status == "answered", (sql, res.status, res.clarifying_question)
+        assert res.rows[0]["v"] == expected, (sql, res.rows[0]["v"], expected)
+
+
+def test_tier2_clarify_carries_proposed_action_and_affirmative_runs_it():
+    """Bug 3a: an ambiguous clarify carries `proposed_action` (the AI's best-guess
+    concrete question). Affirming it = re-asking that exact question on a fresh,
+    stateless /ask, which resolves and returns the ground truth (SELL qty = 85)."""
+    tables, contract = _events_bonds()
+    PROPOSED = "total quantity where buy_sell is SELL"
+
+    def _mapping(q):
+        if q == PROPOSED:  # the affirmative re-ask → confident, unambiguous
+            return {"tables": ["events"], "columns": ["quantity"],
+                    "filters": [{"column": "buy_sell", "op": "=", "value": "SELL"}],
+                    "aggregation": "SUM", "measure": "quantity", "group_by": [],
+                    "confidence": "high", "alternatives": [], "unmappable": False,
+                    "reason": "ok"}
+        # the original vague question → ambiguous, with a best-guess proposal
+        return {"tables": ["events"], "columns": [], "filters": [],
+                "aggregation": None, "measure": None, "group_by": [],
+                "confidence": "low",
+                "alternatives": [{"term": "sold", "options": ["buy_sell", "trade_state"]}],
+                "unmappable": False, "reason": "'sold' is ambiguous",
+                "proposed_question": PROPOSED}
+
+    mock = MockProvider(mapping=_mapping, nl2sql=lambda q: {
+        "sql": "SELECT SUM(quantity) AS v FROM events WHERE buy_sell = 'SELL'",
+        "tables_used": ["events"], "assumptions": [],
+        "needs_clarification": False, "clarifying_question": None})
+
+    # turn 1: vague → clarify carrying the concrete proposed_action, no SQL runs
+    clarify = answer("how many were sold", tables, contract=contract, provider=mock)
+    assert clarify.status == "clarify"
+    assert clarify.proposed_action == PROPOSED
+    assert not clarify.rows
+
+    # turn 2: the "Yes — run it" affirmative re-asks proposed_action → answered
+    affirmed = answer(clarify.proposed_action, tables, contract=contract, provider=mock)
+    assert affirmed.status == "answered"
+    assert affirmed.rows[0]["v"] == 85
+
+
+def test_confident_tier2_answer_has_no_proposed_action():
+    """A confident Tier-2 answer is not a clarify — it must not carry a chip."""
+    tables, contract = _events_bonds()
+    res = answer("how many bond1 sold", tables, contract=contract,
+                 provider=MockProvider(mapping=_bond1_sold_mapping, nl2sql=lambda q: {
+                     "sql": "SELECT SUM(quantity) AS v FROM events WHERE bond_id='BOND1' AND buy_sell='SELL'",
+                     "tables_used": ["events"], "assumptions": [],
+                     "needs_clarification": False, "clarifying_question": None}))
+    assert res.status == "answered"
+    assert res.proposed_action is None

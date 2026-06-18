@@ -27,6 +27,15 @@ class RateLimitError(LLMError):
     """Provider returned 429 / quota exhausted. Distinct so the UI can back off."""
 
 
+class ProviderUnavailableError(LLMError):
+    """Provider is *temporarily* unavailable — 503 overload, other 5xx, or a
+    timeout/network error. Distinct from RateLimitError but treated the same way
+    by the fallback wrapper: the request is sound, the provider just couldn't
+    serve it right now, so retrying it elsewhere is safe. Contrast with
+    LLMConfigError / a 4xx auth-or-validation LLMError, which mean the request or
+    config itself is wrong and must surface loudly rather than be silently retried."""
+
+
 class LLMConfigError(LLMError):
     """Missing API key or misconfiguration — surfaced clearly, never a crash."""
 

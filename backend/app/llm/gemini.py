@@ -16,6 +16,7 @@ from app.llm.base import (
     LLMConfigError,
     LLMError,
     LLMProvider,
+    ProviderUnavailableError,
     RateLimitError,
 )
 
@@ -68,11 +69,19 @@ class GeminiProvider(LLMProvider):
                 timeout=self._timeout,
             )
         except requests.RequestException as e:
-            raise LLMError(f"Gemini request failed: {e}") from e
+            # timeout / connection error → temporary; safe to fall back.
+            raise ProviderUnavailableError(f"Gemini request failed: {e}") from e
 
         if resp.status_code == 429:
             raise RateLimitError("Gemini rate limit / quota exceeded (429).")
+        if resp.status_code >= 500:
+            # 503 overload / other 5xx → temporary; safe to fall back.
+            raise ProviderUnavailableError(
+                f"Gemini temporarily unavailable (HTTP {resp.status_code}): {resp.text[:300]}"
+            )
         if resp.status_code >= 400:
+            # 4xx (bad request, 401/403 bad key) → the request or auth is wrong;
+            # surface loudly, do NOT silently retry elsewhere.
             raise LLMError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
 
         data = resp.json()

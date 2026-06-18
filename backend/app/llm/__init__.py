@@ -13,6 +13,7 @@ from app.llm.base import (
     LLMError,
     LLMProvider,
     LLMResponseError,
+    ProviderUnavailableError,
     RateLimitError,
     extract_json,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "LLMProvider",
     "LLMError",
     "RateLimitError",
+    "ProviderUnavailableError",
     "LLMConfigError",
     "LLMResponseError",
     "extract_json",

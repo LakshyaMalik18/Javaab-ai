@@ -13,6 +13,7 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
+  Legend,
   ResponsiveContainer,
 } from "recharts";
 import type { ChartHint } from "@/lib/types";
@@ -107,19 +108,118 @@ const gridProps = {
 
 export type ChartType = Exclude<ChartHint, "single_value">;
 
+const legendProps = {
+  wrapperStyle: { fontFamily: FONT, fontSize: 12, color: "#C8C8CC" },
+  iconType: "circle" as const,
+  iconSize: 9,
+};
+
+// A clear message in place of a chart we genuinely can't draw — never a blank canvas.
+function ChartFallback({ text }: { text: string }) {
+  return (
+    <div className="flex h-[320px] w-full items-center justify-center rounded-xl border border-[var(--hairline)] bg-white/[0.02] px-8 text-center text-[13px] leading-relaxed text-graphite">
+      {text}
+    </div>
+  );
+}
+
+// Pivot long rows (one row per x×series) into wide rows (one row per x, a column
+// per series value) so a 2-dimension result can be drawn as grouped series.
+function pivot(
+  rows: Record<string, string | number | null>[],
+  xKey: string,
+  seriesKey: string,
+  yKey: string,
+) {
+  const seriesVals: string[] = [];
+  const byX = new Map<string, Record<string, string | number>>();
+  for (const r of rows) {
+    const xv = String(r[xKey] ?? "—");
+    const sv = String(r[seriesKey] ?? "—");
+    if (!seriesVals.includes(sv)) seriesVals.push(sv);
+    if (!byX.has(xv)) byX.set(xv, { [xKey]: xv });
+    const o = byX.get(xv)!;
+    const n = typeof r[yKey] === "number" ? (r[yKey] as number) : 0;
+    o[sv] = ((o[sv] as number) ?? 0) + n;
+  }
+  return { data: Array.from(byX.values()), seriesVals };
+}
+
 export default function ResultChart({
   type,
   rows,
   xKey,
   yKey,
+  seriesKey,
 }: {
   type: ChartType;
   rows: Record<string, string | number | null>[];
   xKey: string;
   yKey: string;
+  seriesKey?: string;
 }) {
   if (type === "table") return null;
 
+  // ── Multi-dimension (two grouping columns) ───────────────────────────────────
+  const grouped = !!seriesKey && seriesKey !== xKey;
+  if (grouped) {
+    // pie/scatter genuinely can't encode two dimensions → say so, don't draw blank.
+    if (type === "pie" || type === "scatter") {
+      return (
+        <ChartFallback
+          text={`A ${type} chart can't represent grouped data with two dimensions (${xKey} × ${seriesKey}). Try the bar chart or the table view.`}
+        />
+      );
+    }
+    const { data, seriesVals } = pivot(rows, xKey, seriesKey!, yKey);
+    return (
+      <div className="h-[320px] w-full">
+        <ResponsiveContainer width="100%" height="100%">
+          {type === "line" ? (
+            <LineChart data={data} margin={{ top: 12, right: 12, left: 0, bottom: 0 }}>
+              <CartesianGrid {...gridProps} />
+              <XAxis dataKey={xKey} {...axisProps} />
+              <YAxis {...axisProps} width={56} tickFormatter={fmtNum} />
+              <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(232,179,57,0.35)" }} />
+              <Legend {...legendProps} />
+              {seriesVals.map((sv, i) => (
+                <Line
+                  key={sv}
+                  type="monotone"
+                  dataKey={sv}
+                  name={sv}
+                  stroke={PALETTE[i % PALETTE.length]}
+                  strokeWidth={2.5}
+                  dot={{ r: 3, fill: PALETTE[i % PALETTE.length], strokeWidth: 0 }}
+                  activeDot={{ r: 6 }}
+                />
+              ))}
+            </LineChart>
+          ) : (
+            <BarChart data={data} margin={{ top: 12, right: 8, left: 0, bottom: 0 }}>
+              <CartesianGrid {...gridProps} />
+              <XAxis dataKey={xKey} {...axisProps} />
+              <YAxis {...axisProps} width={56} tickFormatter={fmtNum} />
+              <Tooltip content={<ChartTooltip />} cursor={{ fill: "rgba(232,179,57,0.08)" }} />
+              <Legend {...legendProps} />
+              {seriesVals.map((sv, i) => (
+                <Bar
+                  key={sv}
+                  dataKey={sv}
+                  name={sv}
+                  fill={PALETTE[i % PALETTE.length]}
+                  radius={[6, 6, 0, 0]}
+                  maxBarSize={48}
+                />
+              ))}
+            </BarChart>
+          )}
+        </ResponsiveContainer>
+      </div>
+    );
+  }
+
+  // ── Single-dimension (unchanged) ─────────────────────────────────────────────
   return (
     <div className="h-[320px] w-full">
       <ResponsiveContainer width="100%" height="100%">

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ChangeRecord(BaseModel):
@@ -110,6 +110,13 @@ class RelationshipEdge(BaseModel):
     confidence: float
     confidence_label: Literal["high", "medium", "low"]
     provisional: bool = False
+    #: exactly ONE edge per connected table-pair is active; only active edges are
+    #: load-bearing at query time (nl2sql prompt + join-path + guardrail whitelist).
+    active: bool = False
+
+    def pair_key(self) -> frozenset:
+        """Undirected table-pair this edge connects (selection is per pair)."""
+        return frozenset({self.from_table, self.to_table})
 
 
 class SchemaContract(BaseModel):
@@ -117,6 +124,15 @@ class SchemaContract(BaseModel):
     Handed verbatim to nl2sql; nothing downstream guesses about the schema."""
     tables: list[TableContract] = Field(default_factory=list)
     relationships: list[RelationshipEdge] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _seed_active_links(self) -> "SchemaContract":
+        # If there are edges but none is active (fresh construction), apply the
+        # per-pair default so query time always has exactly one link per pair. A
+        # contract that already carries an active selection is left untouched.
+        if self.relationships and not any(e.active for e in self.relationships):
+            self.default_activate_relationships()
+        return self
 
     def table(self, name: str) -> TableContract | None:
         for t in self.tables:
@@ -127,6 +143,47 @@ class SchemaContract(BaseModel):
     def guardrail_schema(self) -> dict[str, set[str]]:
         """{table: {columns}} for guardrail.validate_sql."""
         return {t.name: {c.name for c in t.columns} for t in self.tables}
+
+    def active_relationships(self) -> list["RelationshipEdge"]:
+        """The single load-bearing edge per connected table-pair. This is what the
+        nl2sql prompt, the join-path walk, and the guardrail whitelist all see — an
+        inactive (alternative) edge is invisible to query time."""
+        return [e for e in self.relationships if e.active]
+
+    def default_activate_relationships(self) -> None:
+        """Activate exactly one edge per table-pair: the highest-confidence one.
+        Idempotent; the source of the per-pair defaults the UI starts from."""
+        best: dict[frozenset, RelationshipEdge] = {}
+        for e in self.relationships:
+            e.active = False
+            cur = best.get(e.pair_key())
+            if cur is None or e.confidence > cur.confidence:
+                best[e.pair_key()] = e
+        for e in best.values():
+            e.active = True
+
+    def set_active_link(
+        self, from_table: str, from_col: str, to_table: str, to_col: str
+    ) -> bool:
+        """Make one edge the active link for its table-pair and deactivate every
+        other edge on that pair (enforces the one-active-per-pair invariant).
+        Returns False if no matching edge exists."""
+        pair = frozenset({from_table, to_table})
+        target = None
+        for e in self.relationships:
+            if e.pair_key() != pair:
+                continue
+            if (e.from_table, e.from_col, e.to_table, e.to_col) == (
+                from_table, from_col, to_table, to_col
+            ):
+                target = e
+        if target is None:
+            return False
+        for e in self.relationships:
+            if e.pair_key() == pair:
+                e.active = False
+        target.active = True
+        return True
 
     def provisional_columns(self) -> list[tuple[str, str]]:
         return [
@@ -145,6 +202,40 @@ class NL2SQLResult(BaseModel):
     clarifying_question: str | None = None
 
 
+class MappingFilter(BaseModel):
+    """One value-level filter the AI proposes, e.g. BondID = 'BOND1'."""
+    column: str
+    op: Literal["=", "!=", ">", "<", ">=", "<="] = "="
+    value: Any = None
+
+
+class MappingAlternative(BaseModel):
+    """An interpretation the AI considered but didn't commit to — drives clarify.
+    `term` is the user phrase; `options` are the real columns/values it could mean."""
+    term: str = ""
+    options: list[str] = Field(default_factory=list)
+
+
+class MappingProposal(BaseModel):
+    """Tier-2 structured interpretation. The AI proposes how a vague question maps
+    to REAL schema elements — it never returns SQL or a final number. The engine
+    re-validates this against the schema/data and owns the answer."""
+    tables: list[str] = Field(default_factory=list)
+    columns: list[str] = Field(default_factory=list)
+    filters: list[MappingFilter] = Field(default_factory=list)
+    aggregation: str | None = None            # SUM | COUNT | AVG | MIN | MAX | None
+    measure: str | None = None                # column the aggregation applies to
+    group_by: list[str] = Field(default_factory=list)
+    confidence: Literal["high", "low"] = "low"
+    alternatives: list[MappingAlternative] = Field(default_factory=list)
+    unmappable: bool = False
+    reason: str | None = None                 # why unmappable / what it interpreted
+    #: when the AI clarifies, its single best-guess restated as a concrete question.
+    #: Surfaced on the clarify response so a "Yes — run it" affirmative re-asks THIS
+    #: (stateless: it's just a more specific question on the next /ask).
+    proposed_question: str | None = None
+
+
 class InsightResult(BaseModel):
     insight: str = ""
     followups: list[str] = Field(default_factory=list)
@@ -159,6 +250,12 @@ class AnswerResult(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
     followups: list[str] = Field(default_factory=list)
     clarifying_question: str | None = None
+    #: real-schema example questions, returned with a refusal so a dead-end becomes
+    #: something the user can click/try (derived from actual table + column names).
+    suggestions: list[str] = Field(default_factory=list)
+    #: on a clarify, a concrete question the UI's "Yes — run it" chip re-submits.
+    #: None when there's no single sensible action to propose (so no chip renders).
+    proposed_action: str | None = None
     blocked_reason: str | None = None
     error: str | None = None
     error_kind: str | None = None  # e.g. "rate_limit" — lets the web layer pick an HTTP code

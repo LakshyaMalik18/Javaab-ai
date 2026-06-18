@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 from itertools import combinations
+from numbers import Integral
 
 import pandas as pd
 from rapidfuzz import fuzz
@@ -36,6 +37,26 @@ _MEDIUM = 0.65
 
 # don't try to join on tiny/degenerate domains (e.g. booleans, single value)
 _MIN_PK_DISTINCT = 2
+
+# --- coincidental-overlap suppression (the "number-column" false positive) ---
+# A measure column (frequency, months-since-coupon, qty…) is a small domain of
+# integers that, by sheer luck, lives inside a contiguous id range like 1..N and
+# so "contains" perfectly. That overlap is meaningless. We PENALISE (not delete)
+# such a candidate so a coincidence sinks below threshold, while a genuine numeric
+# key with a matching name is rescued by name similarity and merely demoted.
+_MEASURE_FK_PENALTY = 0.50      # max points shaved off a coincidental measure FK
+_NAME_RESCUE_FULL = 0.70        # name_sim ≥ this → no penalty (real key, keep it)
+_NAME_RESCUE_START = 0.50       # name_sim ≤ this → full penalty
+_COINCIDENCE_MAX_DISTINCT = 50  # "small" integer domain on the FK side
+_CONTIGUOUS_RATIO = 0.90        # PK ids fill ≥90% of their min..max span
+
+# A text/dimension column (desk, status, region…) can ALSO coincidentally have its
+# small set of values sit inside some unrelated PK's value set — same false positive
+# as the number case, just non-numeric. Suppress it identically: graded penalty,
+# rescued by name similarity, and never applied to an id-shaped column (a coded key
+# like cst_id is a legitimate text/categorical key and must survive).
+_TEXT_FK_PENALTY = 0.50         # max points shaved off a coincidental text/dim FK
+_TEXT_MIN_CONTAINMENT = 0.50    # the FK values mostly live inside the PK's set
 
 _STRIP_SUFFIX = re.compile(r"(_?(id|key|code|no|num|fk|pk))+$", re.I)
 
@@ -63,6 +84,75 @@ def _distinct_nonnull(series: pd.Series) -> set:
         else:
             out.add(v)
     return out
+
+
+def _all_int(vals: set) -> bool:
+    # accept python ints and numpy integer types (pandas yields np.int64); _bool_
+    # is Integral too, so exclude it explicitly
+    return bool(vals) and all(
+        isinstance(v, Integral) and not isinstance(v, bool) for v in vals
+    )
+
+
+def _is_coincidental_overlap(
+    p_from: dict, fk_vals: set, p_to: dict, pk_vals: set, fk_repeats: bool
+) -> bool:
+    """The coincidence signature: a *measure* FK whose small distinct integer
+    domain happens to fall inside a contiguous id range on the PK side."""
+    if (p_from.get("role") or p_from.get("likely_role")) != "measure":
+        return False
+    if not fk_repeats:                       # a 1:1 column is not this kind of noise
+        return False
+    if not _all_int(fk_vals) or len(fk_vals) > _COINCIDENCE_MAX_DISTINCT:
+        return False
+    # PK side is an "id range" structurally: a unique, dense, contiguous run of
+    # integers (1..N). Coded names like `eventid` don't always profile as role=id,
+    # so we detect the shape, not the label. (_unique is guaranteed by the caller.)
+    if not _all_int(pk_vals):
+        return False
+    lo, hi = min(pk_vals), max(pk_vals)
+    span = hi - lo + 1
+    if span <= 0 or len(pk_vals) / span < _CONTIGUOUS_RATIO:
+        return False
+    # the small measure domain sits entirely inside that id range — the coincidence
+    return all(lo <= v <= hi for v in fk_vals)
+
+
+def _id_shaped_name(norm_name: str) -> bool:
+    """True if the name carries an id-ish suffix (id/key/code/no/num/fk/pk) — i.e.
+    stripping it changes the name. Such columns are legitimate (coded) keys and are
+    exempt from coincidental-overlap suppression."""
+    return _strip_name(norm_name) != norm_name
+
+
+def _is_coincidental_text_overlap(
+    p_from: dict, fk_vals: set, p_to: dict, fk_repeats: bool, containment: float
+) -> bool:
+    """The non-numeric coincidence: a *dimension/text* FK (not id-shaped) whose
+    small value set happens to be contained in an unrelated PK's values, with no
+    naming relationship to corroborate it. Name rescue is applied via the penalty."""
+    if (p_from.get("role") or p_from.get("likely_role")) not in ("dimension", "text"):
+        return False
+    if p_from.get("is_id") or _id_shaped_name(p_from.get("norm_name", "")):
+        return False                          # a coded key, not coincidental noise
+    if not fk_repeats:
+        return False
+    if not fk_vals or len(fk_vals) > _COINCIDENCE_MAX_DISTINCT:
+        return False
+    return containment >= _TEXT_MIN_CONTAINMENT
+
+
+def _coincidence_penalty(name_sim: float, cap: float = _MEASURE_FK_PENALTY) -> float:
+    """Graded penalty: full when the names don't match, fading to zero as name_sim
+    rises into the rescue band (so a real, well-named key is kept). `cap` is the max
+    penalty for the kind of overlap (measure vs text)."""
+    if name_sim >= _NAME_RESCUE_FULL:
+        return 0.0
+    if name_sim <= _NAME_RESCUE_START:
+        return cap
+    span = _NAME_RESCUE_FULL - _NAME_RESCUE_START
+    severity = (_NAME_RESCUE_FULL - name_sim) / span
+    return cap * severity
 
 
 def _type_compatible(p_from: dict, p_to: dict) -> bool:
@@ -109,6 +199,14 @@ def _evaluate_pair(
     )
     if fk_repeats:
         score = min(1.0, score + 0.02)  # nudge: looks like a real many-side
+
+    # suppress coincidental overlaps (graded, name-rescued). Two flavours, mutually
+    # exclusive by FK role: a measure dropping into an id range, or a text/dimension
+    # column whose small value set happens to sit inside an unrelated PK's values.
+    if _is_coincidental_overlap(p_from, fk_vals, p_to, pk_vals, fk_repeats):
+        score = max(0.0, score - _coincidence_penalty(name_sim, _MEASURE_FK_PENALTY))
+    elif _is_coincidental_text_overlap(p_from, fk_vals, p_to, fk_repeats, containment):
+        score = max(0.0, score - _coincidence_penalty(name_sim, _TEXT_FK_PENALTY))
 
     if score < _MIN_SCORE:
         return None

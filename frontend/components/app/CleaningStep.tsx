@@ -10,10 +10,17 @@ export default function CleaningStep({ onNext }: { onNext: () => void }) {
   const [undone, setUndone] = useState<Set<number>>(new Set());
   const [addOpen, setAddOpen] = useState(false);
   const [dupChoice, setDupChoice] = useState<Record<number, "keep" | "remove">>({});
+  const [showAllDupes, setShowAllDupes] = useState(false);
 
   const ledger = report?.ledger ?? [];
   const duplicates = report?.duplicates ?? [];
   const ambiguity = report?.ambiguity ?? [];
+
+  // Near-dup lists can be long on transactional data; show a capped window with a
+  // "view more" rather than dumping every pair into a minute-long scroll.
+  const DUPE_CAP = 8;
+  const visibleDuplicates = showAllDupes ? duplicates : duplicates.slice(0, DUPE_CAP);
+  const hiddenDupeCount = duplicates.length - visibleDuplicates.length;
 
   const toggleUndo = (i: number) =>
     setUndone((s) => {
@@ -157,22 +164,33 @@ export default function CleaningStep({ onNext }: { onNext: () => void }) {
       {duplicates.length > 0 && (
       <h2 className="mt-8 text-[13px] uppercase tracking-wider text-graphite">
         Possible duplicates — your call
+        <span className="ml-2 tnum text-graphite/70">({duplicates.length})</span>
       </h2>
       )}
       <div className="mt-3 space-y-2">
-        {duplicates.map((d, i) => (
+        {visibleDuplicates.map((d, i) => (
           <div
             key={i}
-            className="flex flex-col gap-3 rounded-xl border border-[var(--hairline)] bg-white/[0.02] px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+            className="flex flex-col gap-3 rounded-xl border border-[var(--hairline)] bg-white/[0.02] px-4 py-3 sm:flex-row sm:items-start sm:justify-between"
           >
-            <div className="flex items-center gap-3 text-[13px]">
-              <Pill tone={d.kind === "near" ? "amber" : "muted"}>
-                {d.kind === "near" ? "near-duplicate" : "exact duplicate"}
-              </Pill>
-              <span className="text-ink">{String(d.sample.name)}</span>
-              <span className="tnum text-graphite">rows {d.row_indices.join(", ")}</span>
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center gap-3 text-[13px]">
+                <Pill tone={d.kind === "near" ? "amber" : "muted"}>
+                  {d.kind === "near" ? "Near" : "Exact"}
+                </Pill>
+                <span className="text-ink">{String(d.sample.name)}</span>
+                <span className="tnum text-graphite">rows {d.row_indices.join(", ")}</span>
+              </div>
+              {/* one-line "why" for near-dups: which field differs */}
+              {d.kind === "near" && (
+                <p className="text-[12px] text-graphite">
+                  {d.diff
+                    ? `Differs in ${d.diff}`
+                    : "Rows are similar but differ in a text field."}
+                </p>
+              )}
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               {(["keep", "remove"] as const).map((c) => (
                 <button
                   key={c}
@@ -192,6 +210,15 @@ export default function CleaningStep({ onNext }: { onNext: () => void }) {
           </div>
         ))}
       </div>
+
+      {duplicates.length > DUPE_CAP && (
+        <button
+          onClick={() => setShowAllDupes((v) => !v)}
+          className="mt-3 text-[13px] text-indigo-soft transition hover:text-ink"
+        >
+          {showAllDupes ? "Show fewer" : `View ${hiddenDupeCount} more`}
+        </button>
+      )}
 
       <button
         onClick={onNext}

@@ -14,6 +14,7 @@ from app.llm.base import (
     LLMConfigError,
     LLMError,
     LLMProvider,
+    ProviderUnavailableError,
     RateLimitError,
 )
 
@@ -62,11 +63,18 @@ class GroqProvider(LLMProvider):
                 timeout=self._timeout,
             )
         except requests.RequestException as e:
-            raise LLMError(f"Groq request failed: {e}") from e
+            # timeout / connection error → temporary; safe to fall back.
+            raise ProviderUnavailableError(f"Groq request failed: {e}") from e
 
         if resp.status_code == 429:
             raise RateLimitError("Groq rate limit exceeded (429).")
+        if resp.status_code >= 500:
+            # 503 overload / other 5xx → temporary; safe to fall back.
+            raise ProviderUnavailableError(
+                f"Groq temporarily unavailable (HTTP {resp.status_code}): {resp.text[:300]}"
+            )
         if resp.status_code >= 400:
+            # 4xx (bad request, 401/403 bad key) → surface loudly, do not silently retry.
             raise LLMError(f"Groq HTTP {resp.status_code}: {resp.text[:300]}")
 
         data = resp.json()

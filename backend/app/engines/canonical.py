@@ -1,6 +1,7 @@
 """Canonicalization + near-duplicate detection using rapidfuzz."""
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -159,6 +160,76 @@ def canonicalize_column(
     return result, suggestions
 
 
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _is_strict_column(series: pd.Series) -> bool:
+    """
+    A "strict" column (numeric or date) distinguishes rows and must match exactly
+    for two rows to be near-duplicates. These are exactly the columns a coarse
+    text-key comparison ignores — quantity, price, timestamp — which is why
+    transactional rows that merely share a few categoricals were over-flagged.
+    """
+    if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    non_null = series.dropna().astype(str)
+    if len(non_null) == 0:
+        return False
+    sample = non_null.head(50)
+    iso_hits = sum(1 for v in sample if _ISO_DATE_RE.match(v.strip()))
+    return iso_hits / len(sample) > 0.7
+
+
+def _values_equal_strict(a: Any, b: Any) -> bool:
+    a_na, b_na = pd.isna(a), pd.isna(b)
+    if a_na or b_na:
+        return bool(a_na and b_na)
+    try:
+        return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-9)
+    except (TypeError, ValueError):
+        return str(a).strip() == str(b).strip()
+
+
+def _rows_near_identical(
+    a: pd.Series, b: pd.Series,
+    strict_cols: list[str], text_cols: list[str], threshold: int,
+) -> tuple[bool, float, list[str]]:
+    """
+    Two rows are near-duplicates only when they are near-identical across the
+    *whole* row: every numeric/date column matches exactly, and every text column
+    is equal or fuzzily-equal (punctuation/casing). At least one text column must
+    differ textually — otherwise the rows are exact duplicates (reported separately).
+
+    Returns (is_near, similarity, diff_fields) where diff_fields lists the text
+    columns that actually differ — the "why" surfaced to the user.
+    """
+    for c in strict_cols:
+        if not _values_equal_strict(a[c], b[c]):
+            return False, 0.0, []
+
+    scores: list[float] = []
+    diff_fields: list[str] = []
+    for c in text_cols:
+        av, bv = a[c], b[c]
+        a_na, b_na = pd.isna(av), pd.isna(bv)
+        if a_na or b_na:
+            if a_na and b_na:
+                continue
+            return False, 0.0, []  # one side null, the other not → distinct
+        sa, sb = str(av).strip(), str(bv).strip()
+        if sa == sb:
+            continue
+        score = fuzz.token_sort_ratio(sa, sb, processor=rf_utils.default_process)
+        if score < threshold:
+            return False, 0.0, []
+        diff_fields.append(c)
+        scores.append(score)
+
+    if not diff_fields:
+        return False, 0.0, []  # identical (exact dup) or no text difference → not "near"
+    return True, min(scores) / 100.0, diff_fields
+
+
 def find_near_duplicate_rows(
     df: pd.DataFrame,
     key_columns: list[str] | None = None,
@@ -166,43 +237,58 @@ def find_near_duplicate_rows(
     max_rows: int = 5000,
 ) -> list[dict[str, Any]]:
     """
-    Find near-duplicate rows using fuzzy matching on key text columns.
+    Find near-duplicate rows: rows that are near-identical across the whole row,
+    not merely matching on a handful of categorical columns. Numeric/date columns
+    must match exactly; text columns may differ by punctuation/casing.
+
     Returns list of {indices: [i, j], similarity: float, sample: {...}}.
     Never removes rows.
     """
-    if key_columns is None:
-        key_columns = [c for c in df.columns if df[c].dtype == object][:3]
-
     if len(df) > max_rows:
         df = df.head(max_rows)
+    if len(df) < 2:
+        return []
 
-    def row_key(row: pd.Series) -> str:
-        return " | ".join(str(row[c]) for c in key_columns if c in row.index)
+    strict_cols = [c for c in df.columns if _is_strict_column(df[c])]
+    text_cols = [c for c in df.columns if c not in strict_cols]
 
-    keys = [row_key(df.iloc[i]) for i in range(len(df))]
+    # Cheap text "block" key prefilters candidate pairs so we don't compare every
+    # O(n^2) pair cell-by-cell; the full per-column check below is what actually
+    # decides a near-dup. Honour an explicit key_columns override for callers/tests.
+    block_cols = [c for c in (key_columns or text_cols or list(df.columns)) if c in df.columns]
+
+    def row_key(idx: int) -> str:
+        return " | ".join(str(df.iloc[idx][c]) for c in block_cols)
+
+    keys = [row_key(i) for i in range(len(df))]
     near_dupes = []
     checked: set[tuple[int, int]] = set()
 
     for i, k in enumerate(keys):
         # default_process lowercases + strips punctuation so "Acme, Inc." ~ "Acme Inc"
-        # and "beta llc" ~ "Beta LLC" are caught (exact-matching would miss both).
+        # and "beta llc" ~ "Beta LLC" become candidates (exact-matching misses both).
         matches = process.extract(k, keys, scorer=fuzz.token_sort_ratio,
                                   processor=rf_utils.default_process,
                                   score_cutoff=threshold, limit=10)
-        for match_str, score, j in matches:
+        for _match_str, _score, j in matches:
             if i == j:
                 continue
             pair = (min(i, j), max(i, j))
             if pair in checked:
                 continue
             checked.add(pair)
-            near_dupes.append({
-                "indices": list(pair),
-                "similarity": score / 100.0,
-                "sample": {
-                    "a": dict(df.iloc[i]),
-                    "b": dict(df.iloc[j]),
-                },
-            })
+            ok, sim, diff_fields = _rows_near_identical(
+                df.iloc[i], df.iloc[j], strict_cols, text_cols, threshold
+            )
+            if ok:
+                near_dupes.append({
+                    "indices": list(pair),
+                    "similarity": sim,
+                    "diff_fields": diff_fields,
+                    "sample": {
+                        "a": dict(df.iloc[i]),
+                        "b": dict(df.iloc[j]),
+                    },
+                })
 
     return near_dupes

@@ -10,29 +10,31 @@ export default function SettingsDrawer({
   open: boolean;
   onClose: () => void;
 }) {
-  const { settings, applySettings, applyingSettings } = useAppData();
+  const {
+    settings,
+    applySettings,
+    applyingSettings,
+    primaryProvider,
+    activeProvider,
+    fallbackNote,
+  } = useAppData();
   const [privacy, setPrivacy] = useState(settings.privacyMode);
-  const [provider, setProvider] = useState<"groq" | "gemini">(settings.provider);
   const [key, setKey] = useState(settings.userKey);
 
   // re-sync the form whenever the drawer reopens with the live settings
   useEffect(() => {
     if (open) {
       setPrivacy(settings.privacyMode);
-      setProvider(settings.provider);
       setKey(settings.userKey);
     }
   }, [open, settings]);
 
   const dirty =
-    privacy !== settings.privacyMode ||
-    provider !== settings.provider ||
-    key !== settings.userKey;
+    privacy !== settings.privacyMode || key !== settings.userKey;
 
   const apply = async () => {
     await applySettings({
       privacyMode: privacy,
-      provider: privacy ? "groq" : provider,
       userKey: privacy ? "" : key,
     });
     onClose();
@@ -66,41 +68,52 @@ export default function SettingsDrawer({
               </button>
             </div>
 
-            {/* Privacy Mode */}
+            {/* Privacy Mode — the ONE real switch that selects Groq */}
             <div className="mt-8 rounded-xl border border-[var(--hairline)] p-4">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-4">
                 <div>
                   <div className="text-[14px] text-ink">Privacy Mode</div>
-                  <div className="mt-0.5 text-[12px] text-graphite">
-                    Forces Groq (no-retention) and minimizes the data sample sent.
+                  <div className="mt-0.5 text-[12px] leading-relaxed text-graphite">
+                    Routes every question to Groq (no-retention policy) and never
+                    calls Gemini. Minimizes the data sample sent to the model. Turn
+                    off to use the default Gemini model with an automatic Groq
+                    fallback if Gemini is busy.
                   </div>
                 </div>
                 <Toggle on={privacy} onClick={() => setPrivacy((v) => !v)} />
               </div>
             </div>
 
-            {/* Provider */}
+            {/* Active model — READ-ONLY status, not a selector. Reflects the
+                provider that actually handled the most recent answer (from the
+                backend's used_fallback signal), not the setting. */}
             <div className="mt-4 rounded-xl border border-[var(--hairline)] p-4">
-              <div className="text-[14px] text-ink">Model provider</div>
-              <div className="mt-3 grid grid-cols-2 gap-2">
-                {(["groq", "gemini"] as const).map((p) => (
-                  <button
-                    key={p}
-                    disabled={privacy && p === "gemini"}
-                    onClick={() => setProvider(p)}
-                    className={`rounded-lg border px-3 py-2 text-[13px] transition ${
-                      provider === p
-                        ? "border-indigo-glow/50 bg-indigo-glow/10 text-indigo-soft"
-                        : "border-[var(--hairline)] text-graphite hover:text-ink"
-                    } ${privacy && p === "gemini" ? "cursor-not-allowed opacity-40" : ""}`}
-                  >
-                    {p === "groq" ? "Groq · llama-3.3-70b" : "Gemini 2.5 Flash"}
-                  </button>
-                ))}
+              <div className="flex items-center justify-between">
+                <div className="text-[14px] text-ink">Active model</div>
+                <span className="text-[11px] uppercase tracking-wide text-graphite/60">
+                  status · not a control
+                </span>
               </div>
+              <div className="mt-3 flex items-center gap-2">
+                <ProviderTag name="gemini" active={activeProvider === "gemini"} />
+                <span className="text-graphite/40">·</span>
+                <ProviderTag name="groq" active={activeProvider === "groq"} />
+              </div>
+              <p className="mt-2 text-[11px] leading-relaxed text-graphite/70">
+                {activeProvider === primaryProvider
+                  ? `Currently answering with ${LABEL[primaryProvider]}.`
+                  : `Last answer was served by ${LABEL[activeProvider]}.`}
+              </p>
+              {fallbackNote && (
+                <p className="mt-2 rounded-lg border border-amber-warm/25 bg-amber-warm/[0.06] px-3 py-2 text-[11.5px] leading-relaxed text-amber-warm/90">
+                  {fallbackNote}
+                </p>
+              )}
+            </div>
 
-              {/* BYO key */}
-              <div className="mt-4">
+            {/* BYO Gemini key — used as the default-mode primary key */}
+            <div className="mt-4 rounded-xl border border-[var(--hairline)] p-4">
+              <div className="mt-0">
                 <label className="text-[12px] text-graphite">
                   Bring your own Gemini key
                 </label>
@@ -137,6 +150,35 @@ export default function SettingsDrawer({
         </>
       )}
     </AnimatePresence>
+  );
+}
+
+const LABEL: Record<"groq" | "gemini", string> = {
+  gemini: "Gemini 2.5 Flash",
+  groq: "Groq · llama-3.3-70b",
+};
+
+// Read-only status chip — emphasizes the provider currently in use. NOT clickable.
+function ProviderTag({
+  name,
+  active,
+}: {
+  name: "groq" | "gemini";
+  active: boolean;
+}) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[13px] transition ${
+        active
+          ? "border-indigo-glow/50 bg-indigo-glow/10 text-indigo-soft"
+          : "border-[var(--hairline)] text-graphite/60"
+      }`}
+    >
+      {active && (
+        <span className="h-1.5 w-1.5 rounded-full bg-indigo-glow shadow-glow" />
+      )}
+      {LABEL[name]}
+    </span>
   );
 }
 

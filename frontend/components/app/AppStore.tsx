@@ -17,9 +17,10 @@ import { useToast } from "./Toaster";
 
 export interface Settings {
   privacyMode: boolean;
-  provider: "groq" | "gemini";
   userKey: string;
 }
+
+export type ProviderName = "groq" | "gemini";
 
 interface AppData {
   // session
@@ -46,10 +47,16 @@ interface AppData {
   confirmSchema: (
     edits: api.ColumnEdit[],
     dict: api.DataDictionaryEntry[],
+    relationshipChoices?: api.RelationshipChoice[],
   ) => Promise<boolean>;
 
   // ask
   ask: (question: string) => Promise<AnswerResult>;
+
+  // provider indicator (read-only, reflects the provider that ACTUALLY answered)
+  primaryProvider: ProviderName; // the configured primary for the live session
+  activeProvider: ProviderName; // who handled the most recent answer (or primary)
+  fallbackNote: string | null; // honest note when the last answer fell back
 
   // metrics
   metrics: Metrics | null;
@@ -66,8 +73,9 @@ export function useAppData(): AppData {
 }
 
 const DEFAULT_SETTINGS: Settings = {
-  privacyMode: true, // privacy-first by default — forces Groq, minimal sample
-  provider: "groq",
+  // Privacy Mode OFF for now → default mode (Gemini primary, Groq fallback).
+  // The default flips after a quality comparison.
+  privacyMode: false,
   userKey: "",
 };
 
@@ -92,6 +100,14 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [metricsLoading, setMetricsLoading] = useState(false);
 
+  // who actually handled the last answer. The backend only sets provider_used
+  // when the default-mode primary fell back, so null here means "the primary
+  // answered" (or nothing has been asked yet) → the indicator shows the primary.
+  const [lastAnswerProvider, setLastAnswerProvider] = useState<string | null>(
+    null,
+  );
+  const [fallbackNote, setFallbackNote] = useState<string | null>(null);
+
   // keep the latest session id for the unload handler without re-binding it
   const sessionRef = useRef<string | null>(null);
   sessionRef.current = sessionId;
@@ -101,6 +117,9 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     setSchema(null);
     setSchemaError(null);
     setMetrics(null);
+    // a fresh session has answered nothing yet → indicator resets to the primary
+    setLastAnswerProvider(null);
+    setFallbackNote(null);
   }, []);
 
   const spinUp = useCallback(
@@ -225,11 +244,13 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     async (
       edits: api.ColumnEdit[],
       dict: api.DataDictionaryEntry[],
+      relationshipChoices: api.RelationshipChoice[] = [],
     ): Promise<boolean> => {
       console.log("[confirmSchema] called", {
         sessionId,
         edits: edits.length,
         dict: dict.length,
+        relationshipChoices: relationshipChoices.length,
       });
       if (!sessionId) {
         console.warn("[confirmSchema] no sessionId — bailing");
@@ -239,6 +260,7 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
         const s = await api.confirmSchema(sessionId, {
           column_edits: edits,
           data_dictionary: dict,
+          relationship_choices: relationshipChoices,
         });
         console.log("[confirmSchema] API ok", s);
         setSchema(s);
@@ -260,7 +282,15 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
         return errorAnswer(question, msg);
       }
       try {
-        return await api.ask(sessionId, question);
+        const res = await api.ask(sessionId, question);
+        // Record who REALLY answered, straight from the backend signal — not the
+        // setting. provider_used is present only when the primary fell back to
+        // Groq; otherwise the primary handled it (null → indicator shows primary).
+        if (res.status === "answered") {
+          setLastAnswerProvider(res.provider_used ?? null);
+          setFallbackNote(res.fallback_note ?? null);
+        }
+        return res;
       } catch (e) {
         const msg = e instanceof ApiError ? e.message : "That query failed.";
         toast(msg, "error");
@@ -269,6 +299,16 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     },
     [sessionId, toast],
   );
+
+  // The configured primary for the live session: Groq in Privacy Mode, else
+  // Gemini. Used as the indicator's pre-answer / no-fallback state.
+  const primaryProvider: ProviderName = settings.privacyMode ? "groq" : "gemini";
+  // The provider that ACTUALLY handled the last answer, falling back to the
+  // configured primary when nothing has answered yet or the primary served it.
+  const activeProvider: ProviderName =
+    lastAnswerProvider === "groq" || lastAnswerProvider === "gemini"
+      ? lastAnswerProvider
+      : primaryProvider;
 
   const loadMetrics = useCallback(async () => {
     if (!sessionId) return;
@@ -302,6 +342,9 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
         loadSchema,
         confirmSchema,
         ask,
+        primaryProvider,
+        activeProvider,
+        fallbackNote,
         metrics,
         metricsLoading,
         loadMetrics,

@@ -104,16 +104,23 @@ def discover_header(rows: list[list[str]]) -> tuple[int, int]:
         if not _is_header_like(row):
             continue
 
-        # Multi-row header: only trigger when this row has empty cells (merged groups)
+        # Multi-row header: only trigger when this row has empty cells (merged
+        # groups) AND carries at least two group labels. A lone non-empty cell is a
+        # junk/banner title (e.g. "Bond Trades,,,"), not a merged-header top row —
+        # without this guard it would wrongly pair with the real header below it.
         has_empty = any(v.strip() == "" for v in row)
-        if has_empty and i + 1 < len(rows):
+        row_non_empty = [v.strip() for v in row if v.strip()]
+        if has_empty and len(row_non_empty) >= 2 and i + 1 < len(rows):
             next_row = rows[i + 1]
             if len(next_row) >= min_width and _is_subheader_like(next_row):
                 return i, i + 2
 
-        # Single-row header: require at least 2 unique non-empty cells to avoid data rows
+        # Single-row header: require at least 2 unique non-empty cells to avoid data
+        # rows, AND that the row is reasonably full (>= min_width non-empty cells).
+        # A sparse leading row — a junk/banner line like "Bond Trades,,," or a row
+        # that's mostly empty commas — is skipped so the real header below it wins.
         non_empty = [v.strip() for v in row if v.strip()]
-        if len(set(non_empty)) >= min(len(non_empty), 2):
+        if len(non_empty) >= min_width and len(set(non_empty)) >= min(len(non_empty), 2):
             return i, i + 1
 
     return 0, 1

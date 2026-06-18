@@ -31,6 +31,16 @@ class DataDictionaryEntry(BaseModel):
     description: str
 
 
+class RelationshipChoice(BaseModel):
+    """The user's active-link pick for one connected table-pair. Identifies the
+    chosen edge fully; the engine makes it active and deactivates the pair's others."""
+    from_table: str
+    from_col: str
+    to_table: str
+    to_col: str
+
+
 class ConfirmSchemaRequest(BaseModel):
     column_edits: list[ColumnEdit] = Field(default_factory=list)
     data_dictionary: list[DataDictionaryEntry] = Field(default_factory=list)
+    relationship_choices: list[RelationshipChoice] = Field(default_factory=list)

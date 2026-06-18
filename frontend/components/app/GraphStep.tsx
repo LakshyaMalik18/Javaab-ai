@@ -1,35 +1,111 @@
 "use client";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import JoinDrawSetPiece from "@/components/setpieces/JoinDrawSetPiece";
 import { Pill } from "@/components/ui";
+import type { RelationshipChoice } from "@/lib/api";
 import type { RelationshipEdge } from "@/lib/types";
 import { useAppData } from "./AppStore";
 
+// A stable identity for an edge, and the undirected table-pair it belongs to.
+const edgeId = (e: RelationshipEdge) =>
+  `${e.from_table}.${e.from_col}->${e.to_table}.${e.to_col}`;
+const pairKey = (e: RelationshipEdge) =>
+  [e.from_table, e.to_table].slice().sort().join(" ~ ");
+
+interface Pair {
+  key: string;
+  tables: [string, string];
+  candidates: RelationshipEdge[];
+}
+
 export default function GraphStep({ onNext }: { onNext: () => void }) {
-  const { schema } = useAppData();
-  const discovered = schema?.relationships ?? [];
+  const { schema, confirmSchema } = useAppData();
+  const discovered = useMemo(() => schema?.relationships ?? [], [schema]);
   // Manually-defined joins live in local state — there is no backend persistence
-  // endpoint for relationships yet, so they are surfaced here for confirmation.
+  // endpoint for relationships, so they are surfaced here as local-only candidates.
   const [manual, setManual] = useState<RelationshipEdge[]>([]);
-  const [confirmed, setConfirmed] = useState<Set<number>>(new Set());
   const [showForm, setShowForm] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   const rels = useMemo(() => [...discovered, ...manual], [discovered, manual]);
+  const tables = schema?.tables ?? [];
 
-  const confirmRel = (i: number) => {
-    console.log("[GraphStep] Confirm relationship", i, rels[i]);
-    setConfirmed((s) => new Set(s).add(i));
+  // Group every edge by its undirected table-pair: ONE card / selector per pair.
+  const pairs = useMemo<Pair[]>(() => {
+    const m = new Map<string, Pair>();
+    for (const e of rels) {
+      const k = pairKey(e);
+      const cur = m.get(k);
+      if (cur) cur.candidates.push(e);
+      else
+        m.set(k, {
+          key: k,
+          tables: [e.from_table, e.to_table],
+          candidates: [e],
+        });
+    }
+    // strongest candidate first inside each pair
+    for (const p of m.values())
+      p.candidates.sort((a, b) => b.confidence - a.confidence);
+    return [...m.values()];
+  }, [rels]);
+
+  // active edge per pair: user choice (edgeId) overriding the backend default.
+  const defaultActiveId = (p: Pair) =>
+    edgeId(p.candidates.find((c) => c.active) ?? p.candidates[0]);
+  const [active, setActive] = useState<Record<string, string>>({});
+
+  // seed defaults from the backend's per-pair active flags whenever they change
+  useEffect(() => {
+    setActive((prev) => {
+      const next = { ...prev };
+      for (const p of pairs) if (!(p.key in next)) next[p.key] = defaultActiveId(p);
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pairs]);
+
+  const activeEdge = (p: Pair): RelationshipEdge => {
+    const id = active[p.key] ?? defaultActiveId(p);
+    return p.candidates.find((c) => edgeId(c) === id) ?? p.candidates[0];
   };
 
-  const toggleManual = () => {
-    console.log("[GraphStep] Define a join manually clicked", { showForm });
-    setShowForm((v) => !v);
-  };
+  const choose = (pairK: string, id: string) =>
+    setActive((s) => ({ ...s, [pairK]: id }));
 
+  // The node diagram is only legible for a handful of tables. Cap it: render the
+  // real-schema diagram cards when there are 4 or fewer tables AND a pair to draw;
+  // for 5+ tables render the SAME one-selector-per-pair as a compact list instead.
+  const showDiagram = tables.length > 0 && tables.length <= 4 && pairs.length > 0;
+
+  const toggleManual = () => setShowForm((v) => !v);
   const addManual = (edge: RelationshipEdge) => {
-    console.log("[GraphStep] manual join added", edge);
     setManual((m) => [...m, edge]);
+    // a freshly added link becomes the active choice for its pair
+    setActive((s) => ({ ...s, [pairKey(edge)]: edgeId(edge) }));
     setShowForm(false);
+  };
+
+  const confirmAndNext = async () => {
+    // persist exactly one active link per pair; only DISCOVERED edges go to the
+    // backend (manual edges are local-only — there's no persistence endpoint yet).
+    const discoveredIds = new Set(discovered.map(edgeId));
+    const choices: RelationshipChoice[] = pairs
+      .map((p) => activeEdge(p))
+      .filter((e) => discoveredIds.has(edgeId(e)))
+      .map((e) => ({
+        from_table: e.from_table,
+        from_col: e.from_col,
+        to_table: e.to_table,
+        to_col: e.to_col,
+      }));
+    setSaving(true);
+    try {
+      if (choices.length) await confirmSchema([], [], choices);
+    } finally {
+      setSaving(false);
+      onNext();
+    }
   };
 
   return (
@@ -39,64 +115,63 @@ export default function GraphStep({ onNext }: { onNext: () => void }) {
           How your files connect.
         </h1>
         <p className="mt-2 text-[15px] text-graphite">
-          Discovered by matching values, not just names. Confirm, edit, or add a
-          link — these keys are fed verbatim into every JOIN.
+          Discovered by matching values, not just names. For each pair of files,
+          pick the one link to join on — only the active link is used in every query.
         </p>
       </header>
 
-      <div className="glass-strong rounded-2xl p-4 shadow-glass sm:p-6">
-        <JoinDrawSetPiece />
-      </div>
-
-      <div className="mt-6 space-y-2">
-        {rels.length === 0 && (
+      <div className="space-y-3">
+        {pairs.length === 0 && (
           <p className="rounded-xl border border-[var(--hairline)] bg-white/[0.02] px-4 py-3 text-[13px] text-graphite">
             No relationships were discovered between your files — that&apos;s
             expected for a single table. You can define a join manually below.
           </p>
         )}
-        {rels.map((r, i) => (
-          <div
-            key={i}
-            className="flex flex-col gap-3 rounded-xl border border-[var(--hairline)] bg-white/[0.02] px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
-          >
-            <div className="flex flex-wrap items-center gap-2 text-[13px]">
-              <Pill tone={r.confidence_label === "high" ? "indigo" : "amber"}>
-                {r.confidence_label} · {Math.round(r.confidence * 100)}%
-              </Pill>
-              <code className="text-indigo-soft">
-                {r.from_table}.{r.from_col}
-              </code>
-              <span className="text-graphite">→</span>
-              <code className="text-amber-warm">
-                {r.to_table}.{r.to_col}
-              </code>
-              <span className="text-[11px] text-graphite">many-to-one</span>
-            </div>
-            <div className="flex items-center gap-2">
-              {confirmed.has(i) ? (
-                <span className="rounded-full bg-indigo-glow/15 px-3 py-1 text-[12px] text-indigo-soft">
-                  Confirmed ✓
-                </span>
-              ) : (
-                <button
-                  onClick={() => confirmRel(i)}
-                  className="rounded-full bg-indigo-glow/15 px-3 py-1 text-[12px] text-indigo-soft transition hover:bg-indigo-glow/25"
-                >
-                  Confirm
-                </button>
-              )}
-              <button
-                onClick={toggleManual}
-                className="rounded-full border border-[var(--hairline)] px-3 py-1 text-[12px] text-graphite transition hover:text-ink"
-              >
-                Edit
-              </button>
-            </div>
-          </div>
-        ))}
 
-        {showForm && <ManualJoinForm schema={schema} onAdd={addManual} onCancel={() => setShowForm(false)} />}
+        {pairs.map((p) => {
+          const sel = activeEdge(p);
+          const diagram = showDiagram ? buildDiagramProps(sel, tables) : null;
+          return (
+            <div
+              key={p.key}
+              className="glass-strong rounded-2xl p-4 shadow-glass sm:p-5"
+            >
+              <div className="mb-3 flex items-center gap-2 text-[13px] text-graphite">
+                <code className="text-indigo-soft">{p.tables[0]}</code>
+                <span>⇄</span>
+                <code className="text-indigo-soft">{p.tables[1]}</code>
+              </div>
+
+              {diagram && (
+                <div className="mb-3">
+                  <JoinDrawSetPiece
+                    edge={diagram.edge}
+                    leftTable={diagram.leftTable}
+                    rightTable={diagram.rightTable}
+                    leftCols={diagram.leftCols}
+                    rightCols={diagram.rightCols}
+                    fkRow={diagram.fkRow}
+                    pkRow={diagram.pkRow}
+                  />
+                </div>
+              )}
+
+              <PairSelector
+                pair={p}
+                selectedId={edgeId(sel)}
+                onChange={(id) => choose(p.key, id)}
+              />
+            </div>
+          );
+        })}
+
+        {showForm && (
+          <ManualJoinForm
+            schema={schema}
+            onAdd={addManual}
+            onCancel={() => setShowForm(false)}
+          />
+        )}
 
         <button
           onClick={toggleManual}
@@ -107,13 +182,87 @@ export default function GraphStep({ onNext }: { onNext: () => void }) {
       </div>
 
       <button
-        onClick={onNext}
-        className="mt-8 w-full rounded-full bg-indigo-glow py-3 text-[15px] font-medium text-white shadow-glow transition hover:brightness-110"
+        onClick={confirmAndNext}
+        disabled={saving}
+        className="mt-8 w-full rounded-full bg-indigo-glow py-3 text-[15px] font-medium text-white shadow-glow transition hover:brightness-110 disabled:opacity-60"
       >
-        Start asking questions →
+        {saving ? "Saving links…" : "Start asking questions →"}
       </button>
     </div>
   );
+}
+
+// One selector per pair: a single control whose options are the pair's candidate
+// links, the active one selected. Choosing an alternative switches the active link
+// (there is no multi-select — a pair can only ever have one active link).
+function PairSelector({
+  pair,
+  selectedId,
+  onChange,
+}: {
+  pair: Pair;
+  selectedId: string;
+  onChange: (id: string) => void;
+}) {
+  const sel = pair.candidates.find((c) => edgeId(c) === selectedId);
+  const single = pair.candidates.length === 1;
+  return (
+    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex items-center gap-2 text-[12px] uppercase tracking-wider text-graphite">
+        Active link
+        {sel && (
+          <Pill tone={sel.confidence_label === "high" ? "indigo" : "amber"}>
+            {sel.confidence_label} · {Math.round(sel.confidence * 100)}%
+          </Pill>
+        )}
+      </div>
+      <select
+        value={selectedId}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={single}
+        className="rounded-md border border-[var(--hairline)] bg-obsidian-700 px-3 py-1.5 text-[13px] text-ink disabled:opacity-70"
+      >
+        {pair.candidates.map((c) => (
+          <option key={edgeId(c)} value={edgeId(c)}>
+            {c.from_table}.{c.from_col} → {c.to_table}.{c.to_col} (
+            {c.confidence_label} · {Math.round(c.confidence * 100)}%)
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+// Keep a table card readable: cap the column list, always keeping the join key.
+function capCols(cols: string[], keyCol: string, max = 7): string[] {
+  if (cols.length <= max) return cols;
+  const head = cols.slice(0, max);
+  if (!head.includes(keyCol)) head[max - 1] = keyCol;
+  return head;
+}
+
+// Translate a real RelationshipEdge + the session schema into the props the
+// JoinDrawSetPiece needs — using ACTUAL table/column names, never the mock.
+function buildDiagramProps(
+  edge: RelationshipEdge,
+  tables: { name: string; columns: { name: string }[] }[],
+) {
+  const lt = tables.find((t) => t.name === edge.from_table);
+  const rt = tables.find((t) => t.name === edge.to_table);
+  if (!lt || !rt) return null; // edge references a table we don't have — skip it
+  const leftCols = capCols(lt.columns.map((c) => c.name), edge.from_col);
+  const rightCols = capCols(rt.columns.map((c) => c.name), edge.to_col);
+  const fkRow = Math.max(0, leftCols.indexOf(edge.from_col));
+  const pkRow = Math.max(0, rightCols.indexOf(edge.to_col));
+  return {
+    edge,
+    leftTable: edge.from_table,
+    rightTable: edge.to_table,
+    leftCols,
+    rightCols,
+    fkRow,
+    pkRow,
+  };
 }
 
 function ManualJoinForm({
@@ -136,7 +285,7 @@ function ManualJoinForm({
   const colsOf = (name: string) =>
     tables.find((t) => t.name === name)?.columns ?? [];
 
-  const valid = fromTable && fromCol && toTable && toCol;
+  const valid = fromTable && fromCol && toTable && toCol && fromTable !== toTable;
 
   const submit = () => {
     if (!valid) return;
@@ -148,6 +297,7 @@ function ManualJoinForm({
       confidence: 1,
       confidence_label: "high",
       provisional: false,
+      active: true,
     });
   };
 

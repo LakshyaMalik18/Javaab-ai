@@ -24,6 +24,26 @@ from app.engines import profiler as profiler_mod
 from app.engines.ingest import IngestError
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_IDENT_NONWORD = re.compile(r"[^a-z0-9_]+")
+
+
+def safe_table_name(raw: str) -> str:
+    """Turn a raw filename stem / sheet name into a SQL-safe identifier.
+
+    This is the SINGLE source of a table's name: the value returned here becomes
+    the dict key used for DuckDB registration, profiling, the schema contract, the
+    name shown to the model, and therefore the name in generated SQL. Sanitizing
+    once here keeps all of those identical end-to-end, so the model can never be
+    shown a name it can't faithfully write as a bare identifier (e.g. "events 2024"
+    → "events_2024", never silently normalised to "events" by the model)."""
+    name = (raw or "").strip().lower()
+    name = _IDENT_NONWORD.sub("_", name)  # spaces, hyphens, dots, punctuation → _
+    name = name.strip("_")
+    if not name:
+        name = "table"
+    if name[0].isdigit():  # a bare leading digit isn't a valid identifier
+        name = f"t_{name}"
+    return name
 
 
 def _is_text_categorical(series: pd.Series) -> bool:
@@ -54,10 +74,10 @@ class UploadResult:
 def _ingest_one(filename: str, raw: bytes) -> dict[str, pd.DataFrame]:
     """Bytes → {table_name: raw_df}. Raises IngestError on bad input."""
     ext = Path(filename).suffix.lower()
-    stem = Path(filename).stem.lower() or "data"
+    stem = safe_table_name(Path(filename).stem)
     if ext in (".xlsx", ".xls"):
         sheets = ingest_mod.ingest_excel(raw)
-        return {name.lower(): d["df"] for name, d in sheets.items()}
+        return {safe_table_name(name): d["df"] for name, d in sheets.items()}
     if ext == ".json":
         return {stem: ingest_mod.ingest_json(raw, stem)["df"]}
     return {stem: ingest_mod.ingest_csv(raw, stem)["df"]}
@@ -133,6 +153,22 @@ def process_upload(files: list[tuple[str, bytes]]) -> UploadResult:
                 result.flags.append({
                     "table": name, "kind": "near_duplicate",
                     "pairs": [n["indices"] for n in near],
+                    # per-pair "why": which text field(s) differ, with both values,
+                    # so the UI can explain why a pair is near (not exact).
+                    "diffs": [
+                        {
+                            "indices": n["indices"],
+                            "fields": n.get("diff_fields", []),
+                            "values": {
+                                f: [
+                                    str(n["sample"]["a"].get(f)),
+                                    str(n["sample"]["b"].get(f)),
+                                ]
+                                for f in n.get("diff_fields", [])
+                            },
+                        }
+                        for n in near
+                    ],
                 })
 
     # profiler + join discovery run once all tables are built (joins are cross-table)

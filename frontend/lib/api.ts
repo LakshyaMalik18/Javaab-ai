@@ -239,12 +239,35 @@ function normalizeUpload(raw: RawUploadResponse): UploadReport {
         });
       }
     } else if (kind === "near_duplicate") {
-      for (const pair of (f.pairs as number[][]) || []) {
-        duplicates.push({
-          row_indices: pair,
-          sample: { name: table },
-          kind: "near",
-        });
+      const diffs = (f.diffs as Array<{
+        indices: number[];
+        fields: string[];
+        values: Record<string, [string, string]>;
+      }>) || [];
+      if (diffs.length) {
+        for (const d of diffs) {
+          const note = d.fields
+            .map((fld) => {
+              const [a, b] = d.values[fld] ?? ["", ""];
+              return `${fld}: "${a}" vs "${b}"`;
+            })
+            .join("; ");
+          duplicates.push({
+            row_indices: d.indices,
+            sample: { name: table },
+            kind: "near",
+            diff: note || undefined,
+          });
+        }
+      } else {
+        // backward-compat / mock data: only index pairs, no per-pair detail
+        for (const pair of (f.pairs as number[][]) || []) {
+          duplicates.push({
+            row_indices: pair,
+            sample: { name: table },
+            kind: "near",
+          });
+        }
       }
     }
   }
@@ -294,9 +317,20 @@ export interface DataDictionaryEntry {
   description: string;
 }
 
+export interface RelationshipChoice {
+  from_table: string;
+  from_col: string;
+  to_table: string;
+  to_col: string;
+}
+
 export function confirmSchema(
   sessionId: string,
-  body: { column_edits?: ColumnEdit[]; data_dictionary?: DataDictionaryEntry[] },
+  body: {
+    column_edits?: ColumnEdit[];
+    data_dictionary?: DataDictionaryEntry[];
+    relationship_choices?: RelationshipChoice[];
+  },
 ): Promise<SchemaContract & { applied?: string[] }> {
   return request("/confirm-schema", {
     method: "POST",
@@ -304,6 +338,7 @@ export function confirmSchema(
     json: {
       column_edits: body.column_edits || [],
       data_dictionary: body.data_dictionary || [],
+      relationship_choices: body.relationship_choices || [],
     },
   });
 }

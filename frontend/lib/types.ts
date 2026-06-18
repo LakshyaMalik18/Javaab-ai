@@ -16,6 +16,9 @@ export interface DuplicateGroup {
   row_indices: number[];
   sample: Record<string, string | number | null>;
   kind: "exact" | "near";
+  // for near-dups: a one-line "why" — which text field(s) differ, e.g.
+  // `company: "Acme Inc" vs "Acme, Inc."`. Absent for exact dups.
+  diff?: string;
 }
 
 export interface AmbiguityFlag {
@@ -53,6 +56,9 @@ export interface RelationshipEdge {
   confidence: number;
   confidence_label: "high" | "medium" | "low";
   provisional: boolean;
+  // exactly one edge per connected table-pair is active; only the active link is
+  // used at query time (nl2sql prompt + guardrail whitelist).
+  active?: boolean;
 }
 
 export interface SchemaContract {
@@ -70,6 +76,10 @@ export interface AnswerResult {
   assumptions: string[];
   followups: string[];
   clarifying_question: string | null;
+  // helpful real-schema questions returned with a "couldn't map" refusal
+  suggestions?: string[];
+  // on a clarify, the concrete question a "Yes — run it" chip re-submits
+  proposed_action?: string | null;
   blocked_reason: string | null;
   chart_hint: ChartHint | null;
   columns: string[];

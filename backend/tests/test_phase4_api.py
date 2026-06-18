@@ -103,7 +103,14 @@ def test_happy_path_upload_schema_ask():
 # ── 2. FAIL-LOUD through the API ─────────────────────────────────────────────────
 
 def test_fail_loud_refused_through_api():
-    app, client = _client(nl2sql=lambda q: _JOIN_SQL)
+    # A genuinely-absent concept (no cost/profit column) now fails loud via the
+    # interpretation layer: the model is given the full schema, can't map it, and
+    # declines — the orchestrator turns that into a helpful "couldn't map" refusal.
+    def _decline(q):
+        return {"sql": None, "tables_used": [], "assumptions": [],
+                "needs_clarification": True,
+                "clarifying_question": "There's no cost column, so I can't compute profit margin."}
+    app, client = _client(nl2sql=_decline)
     sid = _new_session(client)
     h = {"X-Session-Id": sid}
     client.post("/upload", files=_upload_files("02_join_pair/customers.csv",
@@ -114,6 +121,7 @@ def test_fail_loud_refused_through_api():
     assert a["status"] == "refused"
     assert a["sql"] is None
     assert a["clarifying_question"]
+    assert a["suggestions"]  # helpful: real-schema questions offered
 
 
 def test_fail_loud_clarify_provisional_through_api():

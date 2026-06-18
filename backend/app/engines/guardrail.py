@@ -114,6 +114,16 @@ class GuardrailResult:
     reason: str
     sql: str | None = None          # possibly LIMIT-injected, ready to run
     tables_used: list[str] = field(default_factory=list)
+    #: why it was blocked, so callers can label it correctly.
+    #:   "ok"             — allowed
+    #:   "destructive"    — non-SELECT / forbidden verb / multi-statement → "read-only by design"
+    #:   "schema_mismatch"— references a table/column not in the schema (hallucinated SQL)
+    #:                      → must still fail loud, but is NOT a destructive block
+    #:   "cross_join"     — a cartesian / cross join with no join condition → fail loud
+    #:                      (a partial/nonsensical join, not a destructive block)
+    #:   "invalid_join_key"— a JOIN welds tables on columns that are NOT a discovered
+    #:                      FK→PK key → fail loud (wrong-key join, silent-0-row risk)
+    kind: str = "ok"
 
     def as_decision(self) -> dict:
         return {
@@ -133,21 +143,34 @@ def validate_sql(
     schema: dict[str, set[str]] | dict[str, list[str]],
     max_rows: int = _DEFAULT_MAX_ROWS,
     metrics: GuardrailMetrics | None = None,
+    relationships=None,
 ) -> GuardrailResult:
-    """Validate one SQL string against the session schema. Never raises."""
-    schema_norm = {_norm(t): {_norm(c) for c in cols} for t, cols in schema.items()}
+    """Validate one SQL string against the session schema. Never raises.
 
-    result = _validate(sql, schema_norm, max_rows)
+    `relationships` (optional) is the discovered FK→PK edge set — an iterable of
+    RelationshipEdge-like objects or dicts with from_table/from_col/to_table/to_col.
+    When provided, every inter-table JOIN condition must match a discovered key
+    (see the INVALID-JOIN-KEY guard). Omitted (None) → that check is skipped, so
+    existing callers/tests are unaffected."""
+    schema_norm = {_norm(t): {_norm(c) for c in cols} for t, cols in schema.items()}
+    edges = _normalize_edges(relationships) if relationships is not None else None
+
+    result = _validate(sql, schema_norm, max_rows, edges)
     if metrics is not None:
         metrics.record(result.as_decision())
     return result
 
 
-def _block(reason: str) -> GuardrailResult:
-    return GuardrailResult(allowed=False, reason=reason)
+def _block(reason: str, kind: str = "destructive") -> GuardrailResult:
+    return GuardrailResult(allowed=False, reason=reason, kind=kind)
 
 
-def _validate(sql: str, schema: dict[str, set[str]], max_rows: int) -> GuardrailResult:
+def _validate(
+    sql: str,
+    schema: dict[str, set[str]],
+    max_rows: int,
+    edges: set[frozenset] | None = None,
+) -> GuardrailResult:
     raw = (sql or "").strip()
     if not raw:
         return _block("empty query")
@@ -192,14 +215,36 @@ def _validate(sql: str, schema: dict[str, set[str]], max_rows: int) -> Guardrail
         if t in cte_names:
             continue
         if t not in schema:
-            return _block(f"unknown table: {t}")
+            return _block(f"unknown table: {t}", kind="schema_mismatch")
         if t not in tables_used:
             tables_used.append(t)
 
     # validate columns that are qualified or unambiguous
     ok, bad_col = _validate_columns(stmt, schema, tables_used, cte_names)
     if not ok:
-        return _block(f"unknown column: {bad_col}")
+        return _block(f"unknown column: {bad_col}", kind="schema_mismatch")
+
+    # CARTESIAN GUARD — a comma join (FROM a, b) or an explicit CROSS JOIN with no
+    # ON/USING multiplies rows and is never what an analytics question means. Catch
+    # it before execution so a partial/nonsensical join can't return a confident
+    # wrong number. (Joins to a subquery/unnest aren't base-table cartesians.)
+    if _has_cross_join(stmt):
+        return _block(
+            "joins two tables with no join condition (cartesian / cross join)",
+            kind="cross_join",
+        )
+
+    # INVALID-JOIN-KEY GUARD — every inter-table JOIN condition must weld the tables
+    # on a DISCOVERED relationship key (a known FK→PK edge). A join that uses the
+    # right tables but the WRONG key columns (e.g. `district.k2 = region.f1` when the
+    # real key is `district.f2 = region.k1`) parses fine, references real columns and
+    # has an ON clause — so it slips past every other guard — yet matches zero rows
+    # and returns a silent, empty/wrong answer. Catch it here. Skipped when no edge
+    # set was supplied.
+    if edges is not None:
+        bad = _invalid_join_key(stmt, _alias_table_map(stmt, schema), edges)
+        if bad:
+            return _block(bad, kind="invalid_join_key")
 
     # defense-in-depth: make text-literal equality case-insensitive so a casing
     # mismatch (status = 'paid' vs a stray 'Paid') can never silently drop rows
@@ -216,6 +261,99 @@ def _validate(sql: str, schema: dict[str, set[str]], max_rows: int) -> Guardrail
 def _has_keyword(lowered_sql: str, token: str) -> bool:
     import re
     return re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", lowered_sql) is not None
+
+
+def _has_cross_join(stmt: exp.Expression) -> bool:
+    """True if any JOIN against a base table lacks a join condition — a comma join
+    (`FROM a, b`) or an explicit `CROSS JOIN`. Joins onto a subquery/unnest/values
+    expression are not base-table cartesians and are left alone."""
+    for j in stmt.find_all(exp.Join):
+        if not isinstance(j.this, exp.Table):
+            continue
+        if j.args.get("on") or j.args.get("using"):
+            continue
+        return True
+    return False
+
+
+def _normalize_edges(relationships) -> set[frozenset]:
+    """Discovered relationships → a set of undirected, normalised key pairs:
+    {frozenset({(table, col), (table, col)}), ...}. Accepts edge objects (with
+    from_table/from_col/to_table/to_col attributes) or dicts."""
+    edges: set[frozenset] = set()
+    for e in relationships or []:
+        if isinstance(e, dict):
+            ft, fc, tt, tc = e["from_table"], e["from_col"], e["to_table"], e["to_col"]
+        else:
+            ft, fc, tt, tc = e.from_table, e.from_col, e.to_table, e.to_col
+        edges.add(frozenset({(_norm(ft), _norm(fc)), (_norm(tt), _norm(tc))}))
+    return edges
+
+
+def _alias_table_map(stmt: exp.Expression, schema: dict[str, set[str]]) -> dict[str, str]:
+    """alias / table-name → real base-table name, for resolving qualified columns."""
+    amap: dict[str, str] = {}
+    for tbl in stmt.find_all(exp.Table):
+        tname = _norm(tbl.name)
+        if tname in schema:
+            amap[_norm(tbl.alias_or_name)] = tname
+            amap[tname] = tname
+    return amap
+
+
+def _col_ref(node: exp.Expression, amap: dict[str, str]) -> tuple[str, str] | None:
+    """A qualified column → (base_table, column), else None (unqualified columns
+    can't be attributed to a table reliably, so they aren't key-checked)."""
+    if not isinstance(node, exp.Column) or not node.table:
+        return None
+    tgt = amap.get(_norm(node.table))
+    return (tgt, _norm(node.name)) if tgt else None
+
+
+def _invalid_join_key(
+    stmt: exp.Expression, amap: dict[str, str], edges: set[frozenset]
+) -> str | None:
+    """Return a reason if any inter-table JOIN condition welds two tables on a pair
+    of columns that is NOT a discovered relationship key; else None.
+
+    A join must have at least ONE inter-table column=column equality that matches a
+    known edge. Column=literal predicates and same-table comparisons are ignored
+    (they aren't join keys); USING(col) must correspond to an edge on that column."""
+    for j in stmt.find_all(exp.Join):
+        if not isinstance(j.this, exp.Table):
+            continue                       # join onto a subquery/unnest — not a base key
+        rt = _norm(j.this.name)
+        if rt not in amap.values():        # not a whitelisted base table
+            continue
+
+        using = j.args.get("using")
+        if using:
+            for u in using:
+                cn = _norm(getattr(u, "name", "") or "")
+                if cn and not any((rt, cn) in pair for pair in edges):
+                    return f"join key {rt}.{cn} (USING) is not a discovered relationship"
+            continue
+
+        on = j.args.get("on")
+        if on is None:
+            continue                       # missing ON → handled by the cartesian guard
+
+        inter_pairs: list[frozenset] = []
+        for eq in on.find_all(exp.EQ):
+            a = _col_ref(eq.this, amap)
+            b = _col_ref(eq.expression, amap)
+            if a and b and a[0] and b[0] and a[0] != b[0]:
+                inter_pairs.append(frozenset({a, b}))
+
+        if not inter_pairs:
+            continue                       # no checkable inter-table key (e.g. col=literal)
+        if not any(p in edges for p in inter_pairs):
+            (t1, c1), (t2, c2) = tuple(next(iter(inter_pairs)))
+            return (
+                f"join {t1}.{c1} = {t2}.{c2} is not a discovered relationship key "
+                f"(the tables aren't linked on those columns)"
+            )
+    return None
 
 
 def _table_names(stmt: exp.Expression) -> list[str]:

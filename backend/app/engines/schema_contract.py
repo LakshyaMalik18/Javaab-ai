@@ -181,4 +181,7 @@ def build_contract(
             provisional=(label != "high"),
         ))
 
+    # SchemaContract seeds the per-pair default selection on construction (the
+    # highest-confidence edge per table-pair becomes the active, load-bearing link;
+    # the user can switch it in the Relationships step).
     return SchemaContract(tables=table_contracts, relationships=edges)
