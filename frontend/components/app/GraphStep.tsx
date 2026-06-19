@@ -27,6 +27,10 @@ export default function GraphStep({ onNext }: { onNext: () => void }) {
   const [manual, setManual] = useState<RelationshipEdge[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Informational FYI shown every time a manual join is added — manual joins are
+  // trusted as-is and never semantically checked (purely informational; the join
+  // is still added normally).
+  const [manualNotice, setManualNotice] = useState(false);
 
   const rels = useMemo(() => [...discovered, ...manual], [discovered, manual]);
   const tables = schema?.tables ?? [];
@@ -85,6 +89,8 @@ export default function GraphStep({ onNext }: { onNext: () => void }) {
     // a freshly added link becomes the active choice for its pair
     setActive((s) => ({ ...s, [pairKey(edge)]: edgeId(edge) }));
     setShowForm(false);
+    // surface the trust caveat every time a manual join is added (informational only)
+    setManualNotice(true);
   };
 
   const confirmAndNext = async () => {
@@ -180,6 +186,25 @@ export default function GraphStep({ onNext }: { onNext: () => void }) {
             onAdd={addManual}
             onCancel={() => setShowForm(false)}
           />
+        )}
+
+        {manualNotice && (
+          <div className="flex items-start gap-3 rounded-xl border border-amber-warm/30 bg-amber-warm/10 px-4 py-3 text-[13px] text-amber-warm">
+            <span aria-hidden className="mt-px select-none">⚠</span>
+            <p className="leading-relaxed">
+              Manual join added. Heads up — Javaab trusts manual joins as-is and
+              doesn&apos;t check whether the two columns are meaningful to join. If
+              you&apos;ve linked unrelated columns, results may be wrong without
+              warning.
+            </p>
+            <button
+              onClick={() => setManualNotice(false)}
+              aria-label="Dismiss note"
+              className="ml-auto shrink-0 text-amber-warm/70 transition hover:text-amber-warm"
+            >
+              ✕
+            </button>
+          </div>
         )}
 
         <button

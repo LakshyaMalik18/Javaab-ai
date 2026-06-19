@@ -160,7 +160,16 @@ function SchemaRow({
   const [desc, setDescLocal] = useState("");
   const low = col.provisional;
 
+  // Two independent, frontend-only informational notes, each tied to its own edit
+  // action. `showTypeNote` is a CAUTION (a type change can break calculations);
+  // `showMeaningNote` is a gentle FYI (how the description is used). They never
+  // trigger each other — a type edit only touches showTypeNote, a meaning/
+  // description edit only touches showMeaningNote.
+  const [showTypeNote, setShowTypeNote] = useState(false);
+  const [showMeaningNote, setShowMeaningNote] = useState(false);
+
   return (
+    <div>
     <div
       className={`grid grid-cols-[1fr_1fr_2fr_auto] items-center gap-2 border-t border-[var(--hairline)] px-4 py-3 ${
         low ? "bg-amber-warm/[0.05] shadow-[inset_2px_0_0_#F0C04A]" : ""
@@ -173,7 +182,14 @@ function SchemaRow({
       <div className="flex flex-col gap-1">
         <select
           defaultValue={col.dtype}
-          onChange={(e) => onEdit({ dtype: e.target.value })}
+          onChange={(e) => {
+            const next = e.target.value;
+            onEdit({ dtype: next }); // schema logic unchanged
+            // Detect an ACTUAL change: new type ≠ originally-detected type
+            // (col.dtype). Reverting back to the detected type hides the note,
+            // so this is not merely "the dropdown was touched".
+            setShowTypeNote(next !== col.dtype);
+          }}
           className="rounded-md border border-[var(--hairline)] bg-obsidian-700 px-2 py-1 text-[12px] text-ink"
         >
           {TYPES.map((tp) => (
@@ -195,7 +211,10 @@ function SchemaRow({
           value={meaning}
           onChange={(e) => {
             setMeaning(e.target.value);
-            onEdit({ meaning: e.target.value });
+            onEdit({ meaning: e.target.value }); // schema logic unchanged
+            // A meaning edit shows the gentle FYI (only when it actually differs
+            // from the detected meaning); never touches the type caution note.
+            setShowMeaningNote(e.target.value.trim() !== col.meaning.trim());
           }}
           className="w-full rounded-md border border-transparent bg-transparent px-1 py-1 text-[13px] text-ink hover:border-[var(--hairline)] focus:border-indigo-glow/50 focus:outline-none"
         />
@@ -210,7 +229,9 @@ function SchemaRow({
                 value={desc}
                 onChange={(e) => {
                   setDescLocal(e.target.value);
-                  onDesc(e.target.value);
+                  onDesc(e.target.value); // schema logic unchanged
+                  // describing a column is also a meaning edit → gentle FYI
+                  setShowMeaningNote(e.target.value.trim().length > 0);
                 }}
                 placeholder="describe what this column means…"
                 className="flex-1 rounded-md border border-[var(--hairline)] bg-obsidian-700 px-2 py-1 text-[12px] text-ink placeholder:text-graphite/60"
@@ -224,6 +245,49 @@ function SchemaRow({
         {col.is_id && <Pill tone="muted">{col.is_fk ? "FK" : "PK"}</Pill>}
         {low && <Pill tone="amber">provisional</Pill>}
       </div>
+    </div>
+
+    {/* Note 1 — TYPE change: CAUTION tone (amber/warning). Something can break. */}
+    {showTypeNote && (
+      <div className="mx-4 mb-3 flex items-start gap-3 rounded-xl border border-amber-warm/30 bg-amber-warm/10 px-4 py-3 text-[13px] text-amber-warm">
+        <span aria-hidden className="mt-px select-none">⚠</span>
+        <p className="leading-relaxed">
+          You changed this column&apos;s type. Javaab will use your choice — but
+          forcing a number to text (or text to number) can break calculations
+          like sums and averages, or cause errors. Only change the type if
+          you&apos;re sure it&apos;s correct.
+        </p>
+        <button
+          onClick={() => setShowTypeNote(false)}
+          aria-label="Dismiss note"
+          className="ml-auto shrink-0 text-amber-warm/70 transition hover:text-amber-warm"
+        >
+          ✕
+        </button>
+      </div>
+    )}
+
+    {/* Note 2 — MEANING change: gentle, muted FYI (NOT a warning). Here's how it helps. */}
+    {showMeaningNote && (
+      <div className="mx-4 mb-3 flex items-start gap-3 rounded-xl border border-[var(--hairline)] bg-white/[0.03] px-4 py-3 text-[13px] text-graphite">
+        <span aria-hidden className="mt-px select-none text-graphite/70">ℹ</span>
+        <p className="leading-relaxed">
+          Got it — Javaab uses each column&apos;s description to match your
+          questions to the right column. A clearer description helps it answer
+          correctly (e.g. labeling a column &ldquo;revenue&rdquo; lets questions
+          about &ldquo;revenue&rdquo; find it). Just make sure the description
+          matches what the column actually contains, since a wrong description
+          can send questions to the wrong column.
+        </p>
+        <button
+          onClick={() => setShowMeaningNote(false)}
+          aria-label="Dismiss note"
+          className="ml-auto shrink-0 text-graphite/60 transition hover:text-ink"
+        >
+          ✕
+        </button>
+      </div>
+    )}
     </div>
   );
 }
